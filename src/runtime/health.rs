@@ -191,17 +191,13 @@ pub struct HealthMonitor {
 impl HealthMonitor {
     pub fn new() -> Self {
         Self {
-            latency: MetricTracker::new("latency_ms", 1000)
-                .with_thresholds(100.0, 500.0),
+            latency: MetricTracker::new("latency_ms", 1000).with_thresholds(100.0, 500.0),
             cache_hit_rate: MetricTracker::new("cache_hit_rate", 100),
-            vram_usage: MetricTracker::new("vram_mb", 100)
-                .with_thresholds(3500.0, 3900.0),
-            ram_usage: MetricTracker::new("ram_mb", 100)
-                .with_thresholds(28000.0, 31000.0),
+            vram_usage: MetricTracker::new("vram_mb", 100).with_thresholds(3500.0, 3900.0),
+            ram_usage: MetricTracker::new("ram_mb", 100).with_thresholds(28000.0, 31000.0),
             safety_score: MetricTracker::new("safety_score", 1000),
             mpd_agreement: MetricTracker::new("mpd_agreement", 1000),
-            load_stalls: MetricTracker::new("load_stalls", 100)
-                .with_thresholds(5.0, 20.0),
+            load_stalls: MetricTracker::new("load_stalls", 100).with_thresholds(5.0, 20.0),
             total_tokens: 0,
         }
     }

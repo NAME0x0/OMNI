@@ -7,6 +7,6 @@
 //! - **Superposition** via majority vote for set union
 
 pub mod hdm;
-pub mod hdm_codebook;
 pub mod hdm_binding;
+pub mod hdm_codebook;
 pub mod hdm_retrieval;

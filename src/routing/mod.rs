@@ -1,4 +1,4 @@
-//! Routing module — Manifold-organised expert selection on a 2D flat torus.
+//! Routing module — Manifold-organised expert selection on a 3D flat torus.
 
 pub mod delta_stream;
 pub mod manifold;

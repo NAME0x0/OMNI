@@ -212,9 +212,12 @@ mod tests {
         let mat = HyperVector::random(300);
 
         let fact = encode_fact(
-            &subj_role, &cat,
-            &pred_role, &sits_on,
-            &obj_role, &mat,
+            &subj_role,
+            &cat,
+            &pred_role,
+            &sits_on,
+            &obj_role,
+            &mat,
             "cat sits on mat",
             0,
         );
@@ -240,18 +243,8 @@ mod tests {
 
     #[test]
     fn test_merge_traces() {
-        let a = MemoryTrace::from_binding(
-            &HyperVector::random(1),
-            &HyperVector::random(2),
-            "a",
-            0,
-        );
-        let b = MemoryTrace::from_binding(
-            &HyperVector::random(3),
-            &HyperVector::random(4),
-            "b",
-            1,
-        );
+        let a = MemoryTrace::from_binding(&HyperVector::random(1), &HyperVector::random(2), "a", 0);
+        let b = MemoryTrace::from_binding(&HyperVector::random(3), &HyperVector::random(4), "b", 1);
 
         let merged = merge_traces(&[&a, &b]);
         // Merged should have some structure

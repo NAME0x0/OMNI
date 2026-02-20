@@ -339,7 +339,8 @@ impl TernaryExpertFfn {
 
     /// Total storage size in bytes.
     pub fn size_bytes(&self) -> usize {
-        self.w_gate.size_bytes() + self.w_up.size_bytes() + self.w_down.size_bytes() + 12 // 3 scales
+        self.w_gate.size_bytes() + self.w_up.size_bytes() + self.w_down.size_bytes() + 12
+        // 3 scales
     }
 
     /// Total parameter count.

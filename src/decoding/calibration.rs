@@ -4,7 +4,6 @@
 //! accuracy. A well-calibrated model that says "80% confident" should be
 //! correct ~80% of the time.
 
-
 /// A single prediction with confidence and correctness.
 #[derive(Clone, Debug)]
 pub struct CalibrationSample {
@@ -82,8 +81,7 @@ impl CalibrationAnalyzer {
             .map(|(_i, bin)| {
                 let avg_conf: f64 =
                     bin.iter().map(|s| s.confidence).sum::<f64>() / bin.len() as f64;
-                let accuracy =
-                    bin.iter().filter(|s| s.correct).count() as f64 / bin.len() as f64;
+                let accuracy = bin.iter().filter(|s| s.correct).count() as f64 / bin.len() as f64;
                 CalibrationBin {
                     avg_confidence: avg_conf,
                     accuracy,
@@ -103,17 +101,13 @@ impl CalibrationAnalyzer {
         let bins = self.compute_bins();
         let n = self.samples.len() as f64;
 
-        bins.iter()
-            .map(|bin| bin.count as f64 / n * bin.gap)
-            .sum()
+        bins.iter().map(|bin| bin.count as f64 / n * bin.gap).sum()
     }
 
     /// Maximum Calibration Error: max gap across bins.
     pub fn mce(&self) -> f64 {
         let bins = self.compute_bins();
-        bins.iter()
-            .map(|bin| bin.gap)
-            .fold(0.0f64, f64::max)
+        bins.iter().map(|bin| bin.gap).fold(0.0f64, f64::max)
     }
 
     /// Overall accuracy.
@@ -121,8 +115,7 @@ impl CalibrationAnalyzer {
         if self.samples.is_empty() {
             return 0.0;
         }
-        self.samples.iter().filter(|s| s.correct).count() as f64
-            / self.samples.len() as f64
+        self.samples.iter().filter(|s| s.correct).count() as f64 / self.samples.len() as f64
     }
 
     /// Average confidence.
@@ -130,8 +123,7 @@ impl CalibrationAnalyzer {
         if self.samples.is_empty() {
             return 0.0;
         }
-        self.samples.iter().map(|s| s.confidence).sum::<f64>()
-            / self.samples.len() as f64
+        self.samples.iter().map(|s| s.confidence).sum::<f64>() / self.samples.len() as f64
     }
 
     /// Number of samples.

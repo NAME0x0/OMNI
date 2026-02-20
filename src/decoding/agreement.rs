@@ -99,9 +99,7 @@ pub fn jensen_shannon_divergence(distributions: &[Array1<f32>]) -> f64 {
 }
 
 /// Compute agreement across multiple perspective logit outputs.
-pub fn compute_agreement(
-    perspective_logits: &[Array1<f32>],
-) -> AgreementResult {
+pub fn compute_agreement(perspective_logits: &[Array1<f32>]) -> AgreementResult {
     assert!(!perspective_logits.is_empty());
 
     let k = perspective_logits.len();
@@ -113,10 +111,8 @@ pub fn compute_agreement(
         .collect();
 
     // Get argmax per perspective
-    let per_perspective_tokens: Vec<usize> = distributions
-        .iter()
-        .map(|probs| argmax(probs))
-        .collect();
+    let per_perspective_tokens: Vec<usize> =
+        distributions.iter().map(|probs| argmax(probs)).collect();
 
     // Base perspective's choice
     let base_token = per_perspective_tokens[0];
@@ -226,7 +222,12 @@ mod tests {
     #[test]
     fn test_agreement_unanimous() {
         let logits = Array1::from_vec(vec![-10.0, -10.0, 10.0, -10.0]);
-        let all_logits = vec![logits.clone(), logits.clone(), logits.clone(), logits.clone()];
+        let all_logits = vec![
+            logits.clone(),
+            logits.clone(),
+            logits.clone(),
+            logits.clone(),
+        ];
         let result = compute_agreement(&all_logits);
         assert!(result.unanimous);
         assert_eq!(result.token_id, 2);

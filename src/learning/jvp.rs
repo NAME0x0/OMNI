@@ -87,11 +87,7 @@ pub fn jvp_elementwise_mul(
 
 /// Compute JVP for RMS normalization.
 /// If y = x / rms(x) · scale, then dy ≈ (dx - y · (y · dx)/d) / rms · scale
-pub fn jvp_rms_norm(
-    x: &Array1<f32>,
-    dx: &Array1<f32>,
-    scale: &Array1<f32>,
-) -> Array1<f32> {
+pub fn jvp_rms_norm(x: &Array1<f32>, dx: &Array1<f32>, scale: &Array1<f32>) -> Array1<f32> {
     let d = x.len() as f32;
     let rms = (x.iter().map(|v| v * v).sum::<f32>() / d).sqrt() + 1e-6;
     let y = x / rms;
@@ -130,19 +126,13 @@ pub fn jvp_softmax(probs: &Array1<f32>, dx: &Array1<f32>) -> Array1<f32> {
 /// we compute the directional derivative along a random direction,
 /// then use it as a noisy gradient estimate:
 ///   g_hat ≈ (JVP · v) · v
-pub fn estimate_gradient_direction(
-    loss_jvp: f32,
-    direction: &Array1<f32>,
-) -> Array1<f32> {
+pub fn estimate_gradient_direction(loss_jvp: f32, direction: &Array1<f32>) -> Array1<f32> {
     direction * loss_jvp
 }
 
 /// Multi-sample gradient estimator: average of K directional estimates.
 /// More samples → lower variance but higher cost.
-pub fn multi_sample_gradient(
-    loss_jvps: &[f32],
-    directions: &[Array1<f32>],
-) -> Array1<f32> {
+pub fn multi_sample_gradient(loss_jvps: &[f32], directions: &[Array1<f32>]) -> Array1<f32> {
     assert_eq!(loss_jvps.len(), directions.len());
     let k = loss_jvps.len() as f32;
 

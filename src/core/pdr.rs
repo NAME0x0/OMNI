@@ -1,20 +1,18 @@
-//! Perspective Decay Recurrence (PDR) — the novel sequence-processing primitive.
+//! Perspective Decay Recurrence (PDR).
 //!
-//! PDR replaces self-attention in 60 of 80 layers.  Each layer maintains a
-//! fixed-size recurrent state `s ∈ R^{d_model × rank}` that is updated per token
-//! via a gated decay-and-accumulate rule:
+//! This layer keeps a recurrent matrix state `S_t in R^{d_model x rank}`:
 //!
 //! ```text
-//! λ  = sigmoid(W_λ · h)            ∈ (0,1)^rank
-//! s' = diag(λ) · s + W_v · h       (decay old state, inject new info)
-//! o  = W_o · (W_p · s')            (project state to output)
-//! h' = h + o                        (residual connection)
+//! p_t     = W_p h_t + b_p
+//! gamma_t = sigmoid(p_t)
+//! k_t     = W_k h_t
+//! v_t     = W_v h_t
+//! S_t     = diag(gamma_t) S_{t-1} + v_t k_t^T
+//! q_t     = W_q h_t
+//! o_hat_t = S_t q_t
+//! o_t     = W_o o_hat_t
+//! h'_t    = h_t + o_t
 //! ```
-//!
-//! Key properties:
-//! - O(1) per-token computation (no attention over past tokens)
-//! - Fixed memory: d_model × rank × 4 bytes per layer = 2 MB at rank=256
-//! - Supports parallel scan for prompt prefill
 
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
@@ -26,19 +24,22 @@ use super::pdr_state::PdrState;
 /// Weights for a single PDR layer.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PdrLayer {
-    /// Decay gate projection: W_λ ∈ R^{rank × d_model}
-    pub w_lambda: Array2<f32>,
-
-    /// Bias for decay gate: b_λ ∈ R^{rank}
-    pub b_lambda: Array1<f32>,
-
-    /// Value projection: W_v ∈ R^{rank × d_model}
-    pub w_v: Array2<f32>,
-
-    /// State-to-output projection: W_p ∈ R^{d_model × rank}
+    /// Perspective projection: `W_p in R^{d_model x d_model}`.
     pub w_p: Array2<f32>,
 
-    /// Output projection: W_o ∈ R^{d_model × d_model}
+    /// Perspective bias: `b_p in R^{d_model}`.
+    pub b_p: Array1<f32>,
+
+    /// Key projection: `W_k in R^{rank x d_model}`.
+    pub w_k: Array2<f32>,
+
+    /// Value projection: `W_v in R^{d_model x d_model}`.
+    pub w_v: Array2<f32>,
+
+    /// Query projection: `W_q in R^{rank x d_model}`.
+    pub w_q: Array2<f32>,
+
+    /// Output projection: `W_o in R^{d_model x d_model}`.
     pub w_o: Array2<f32>,
 
     /// RMSNorm scale for pre-norm.
@@ -52,10 +53,11 @@ impl PdrLayer {
     /// Create a new PDR layer with zero-initialised weights.
     pub fn zeros(layer_idx: usize) -> Self {
         Self {
-            w_lambda: Array2::zeros((PDR_RANK, D_MODEL)),
-            b_lambda: Array1::zeros(PDR_RANK),
-            w_v: Array2::zeros((PDR_RANK, D_MODEL)),
-            w_p: Array2::zeros((D_MODEL, PDR_RANK)),
+            w_p: Array2::zeros((D_MODEL, D_MODEL)),
+            b_p: Array1::zeros(D_MODEL),
+            w_k: Array2::zeros((PDR_RANK, D_MODEL)),
+            w_v: Array2::zeros((D_MODEL, D_MODEL)),
+            w_q: Array2::zeros((PDR_RANK, D_MODEL)),
             w_o: Array2::zeros((D_MODEL, D_MODEL)),
             rms_scale: Array1::ones(D_MODEL),
             layer_idx,
@@ -66,25 +68,30 @@ impl PdrLayer {
     ///
     /// Updates `state` in-place and returns the output hidden state.
     pub fn forward_step(&self, h: &Array1<f32>, state: &mut PdrState) -> Array1<f32> {
+        if h.len() != D_MODEL {
+            return h.clone();
+        }
+
         // Pre-norm (RMSNorm)
         let h_norm = rms_norm(h, &self.rms_scale);
 
-        // λ = sigmoid(W_λ · h + b_λ)
-        let lambda = sigmoid(&(self.w_lambda.dot(&h_norm) + &self.b_lambda));
+        // Perspective -> decay gate
+        let p = self.w_p.dot(&h_norm) + &self.b_p;
+        let gamma = sigmoid(&p);
 
-        // v = W_v · h
+        // Key/value projections for recurrent update
+        let k = self.w_k.dot(&h_norm);
         let v = self.w_v.dot(&h_norm);
 
-        // s' = diag(λ) · s + v  (column-wise decay + accumulate)
-        state.decay_and_accumulate(&lambda, &v);
+        // S_t = diag(gamma_t) S_{t-1} + v_t k_t^T
+        state.decay_and_accumulate(&gamma, &v, &k);
 
-        // project: W_p · s' → intermediate ∈ R^{d_model}
-        let projected = self.w_p.dot(&state.mean_state());
+        // Query and readout
+        let q = self.w_q.dot(&h_norm);
+        let readout = state.readout(&q);
 
-        // output: W_o · projected
-        let output = self.w_o.dot(&projected);
-
-        // Residual connection
+        // Output projection + residual connection
+        let output = self.w_o.dot(&readout);
         h + &output
     }
 
@@ -99,9 +106,7 @@ impl PdrLayer {
         let seq_len = h_seq.nrows();
         let mut outputs = Array2::zeros((seq_len, D_MODEL));
 
-        // For prefill, we use the sequential scan (parallel scan is an
-        // optimisation that produces identical results — implement later
-        // with work-efficient Blelloch scan).
+        // Sequential reference path (parallel scan can replace this later).
         for t in 0..seq_len {
             let h_t = h_seq.row(t).to_owned();
             let out_t = self.forward_step(&h_t, state);
@@ -113,17 +118,18 @@ impl PdrLayer {
 
     /// Parameter count for this layer.
     pub fn param_count(&self) -> usize {
-        let w_lambda = PDR_RANK * D_MODEL;
-        let b_lambda = PDR_RANK;
-        let w_v = PDR_RANK * D_MODEL;
-        let w_p = D_MODEL * PDR_RANK;
+        let w_p = D_MODEL * D_MODEL;
+        let b_p = D_MODEL;
+        let w_k = PDR_RANK * D_MODEL;
+        let w_v = D_MODEL * D_MODEL;
+        let w_q = PDR_RANK * D_MODEL;
         let w_o = D_MODEL * D_MODEL;
         let rms = D_MODEL;
-        w_lambda + b_lambda + w_v + w_p + w_o + rms
+        w_p + b_p + w_k + w_v + w_q + w_o + rms
     }
 }
 
-/// RMSNorm: x * scale / sqrt(mean(x²) + ε)
+/// RMSNorm: `x * scale / sqrt(mean(x^2) + eps)`.
 fn rms_norm(x: &Array1<f32>, scale: &Array1<f32>) -> Array1<f32> {
     let eps = 1e-6_f32;
     let mean_sq = x.mapv(|v| v * v).mean().unwrap_or(1.0);
@@ -131,7 +137,7 @@ fn rms_norm(x: &Array1<f32>, scale: &Array1<f32>) -> Array1<f32> {
     x / rms * scale
 }
 
-/// Element-wise sigmoid: 1 / (1 + exp(-x))
+/// Element-wise sigmoid: `1 / (1 + exp(-x))`.
 fn sigmoid(x: &Array1<f32>) -> Array1<f32> {
     x.mapv(|v| 1.0 / (1.0 + (-v).exp()))
 }
@@ -166,10 +172,10 @@ mod tests {
     fn test_sigmoid_bounds() {
         let x = Array1::from_vec(vec![-10.0, -1.0, 0.0, 1.0, 10.0]);
         let s = sigmoid(&x);
-        for &v in s.iter() {
+        for &v in &s {
             assert!(v > 0.0 && v < 1.0, "sigmoid out of bounds: {}", v);
         }
-        // Check symmetry: sigmoid(0) ≈ 0.5
+        // Check symmetry: sigmoid(0) ~= 0.5
         assert!((s[2] - 0.5).abs() < 1e-6);
     }
 
@@ -178,7 +184,7 @@ mod tests {
         let x = Array1::from_vec(vec![3.0, 4.0]);
         let scale = Array1::ones(2);
         let normed = rms_norm(&x, &scale);
-        // RMS of [3,4] = sqrt((9+16)/2) = sqrt(12.5) ≈ 3.536
+        // RMS of [3,4] = sqrt((9+16)/2) = sqrt(12.5) ~= 3.536
         let expected_rms = (12.5_f32 + 1e-6).sqrt();
         assert!((normed[0] - 3.0 / expected_rms).abs() < 1e-4);
     }
@@ -186,9 +192,7 @@ mod tests {
     #[test]
     fn test_pdr_param_count() {
         let layer = PdrLayer::zeros(0);
-        // Expected: 2 * (256 * 4096) + 256 + (4096 * 256) + (4096 * 4096) + 4096
-        let expected = 2 * PDR_RANK * D_MODEL + PDR_RANK + D_MODEL * PDR_RANK
-            + D_MODEL * D_MODEL + D_MODEL;
+        let expected = 3 * D_MODEL * D_MODEL + 2 * PDR_RANK * D_MODEL + 2 * D_MODEL;
         assert_eq!(layer.param_count(), expected);
     }
 }

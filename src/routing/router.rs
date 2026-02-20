@@ -1,14 +1,15 @@
 //! Expert router — projects hidden states onto the torus and selects top-1 expert.
 //!
 //! The router maps each token's hidden state h ∈ R^{d_model} to a point on the
-//! torus via a learned linear projection W_route ∈ R^{2 × d_model}, then selects
+//! torus via a learned linear projection W_route ∈ R^{3 × d_model}, then selects
 //! the nearest expert on the manifold.
 //!
-//! Total router overhead: 2 × 4096 = 8,192 parameters per layer × 80 layers
-//! = 655,360 parameters (~0.00006% of total model).
+//! Total router overhead: 3 × 4096 = 12,288 parameters per layer × 80 layers
+//! = 983,040 parameters (~0.00009% of total model).
 
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 
 use crate::config::{D_MODEL, N_EXPERTS, N_LAYERS};
 use crate::routing::manifold::{ExpertManifold, TorusPoint};
@@ -16,28 +17,29 @@ use crate::routing::manifold::{ExpertManifold, TorusPoint};
 /// Routing weights for a single layer.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LayerRouter {
-    /// Projection: W_route ∈ R^{2 × d_model}
+    /// Projection: W_route ∈ R^{3 × d_model}
     pub w_route: Array2<f32>,
 
-    /// Bias: b_route ∈ R^{2}
+    /// Bias: b_route ∈ R^{3}
     pub b_route: Array1<f32>,
 }
 
 impl LayerRouter {
     pub fn zeros() -> Self {
         Self {
-            w_route: Array2::zeros((2, D_MODEL)),
-            b_route: Array1::zeros(2),
+            w_route: Array2::zeros((3, D_MODEL)),
+            b_route: Array1::zeros(3),
         }
     }
 
     /// Project hidden state to a point on the torus.
     pub fn project(&self, h: &Array1<f32>) -> TorusPoint {
         let raw = self.w_route.dot(h) + &self.b_route;
-        // Sigmoid to map to [0, 1) then onto torus
-        let x = sigmoid(raw[0]);
-        let y = sigmoid(raw[1]);
-        TorusPoint::new(x, y)
+        // Modular projection directly onto T³ = [0,1)^3.
+        let x = raw[0].rem_euclid(1.0);
+        let y = raw[1].rem_euclid(1.0);
+        let z = raw[2].rem_euclid(1.0);
+        TorusPoint::new(x, y, z)
     }
 
     /// Route: project hidden state to torus, find nearest expert.
@@ -54,7 +56,7 @@ impl LayerRouter {
     }
 
     pub fn param_count(&self) -> usize {
-        2 * D_MODEL + 2
+        3 * D_MODEL + 3
     }
 }
 
@@ -95,6 +97,21 @@ impl ModelRouter {
         self.layers[layer].route(h, &self.manifold)
     }
 
+    /// Route and fold the routed token position back into the selected expert.
+    ///
+    /// This updates manifold coordinates in place (no coordinate appends).
+    pub fn route_and_fold(
+        &mut self,
+        layer: usize,
+        h: &Array1<f32>,
+        fold_rate: f32,
+    ) -> RoutingDecision {
+        let decision = self.layers[layer].route(h, &self.manifold);
+        self.manifold
+            .fold_observation(decision.expert_id, &decision.torus_point, fold_rate);
+        decision
+    }
+
     /// Route a token through all layers (used for prefetch planning).
     /// Returns the predicted expert for each layer.
     pub fn route_all_layers(&self, h: &Array1<f32>) -> Vec<RoutingDecision> {
@@ -106,11 +123,7 @@ impl ModelRouter {
 
     /// Predict the expert for layer `target_layer` using the hidden state
     /// from `current_layer`.  Used for prefetch-ahead.
-    pub fn predict_ahead(
-        &self,
-        current_h: &Array1<f32>,
-        target_layer: usize,
-    ) -> RoutingDecision {
+    pub fn predict_ahead(&self, current_h: &Array1<f32>, target_layer: usize) -> RoutingDecision {
         self.layers[target_layer].route(current_h, &self.manifold)
     }
 
@@ -144,7 +157,7 @@ impl ModelRouter {
         // Gini coefficient
         let sorted: Vec<f64> = {
             let mut s: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
-            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
             s
         };
         let n = sorted.len() as f64;
@@ -181,10 +194,6 @@ pub struct LoadBalanceStats {
     pub gini: f64,
 }
 
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,7 +226,7 @@ mod tests {
     #[test]
     fn test_layer_router_param_count() {
         let r = LayerRouter::zeros();
-        assert_eq!(r.param_count(), 2 * D_MODEL + 2);
+        assert_eq!(r.param_count(), 3 * D_MODEL + 3);
     }
 
     #[test]
@@ -225,7 +234,7 @@ mod tests {
         let decisions: Vec<RoutingDecision> = (0..1000)
             .map(|i| RoutingDecision {
                 expert_id: i % N_EXPERTS,
-                torus_point: TorusPoint::new(0.0, 0.0),
+                torus_point: TorusPoint::new(0.0, 0.0, 0.0),
                 distance: 0.0,
             })
             .collect();
@@ -233,5 +242,32 @@ mod tests {
         // Nearly balanced: gini should be very small
         assert!(stats.gini < 0.05, "gini = {}", stats.gini);
         assert_eq!(stats.max_count - stats.min_count, 1); // 1000 / 128 ≈ 7.8
+    }
+
+    #[test]
+    fn test_project_uses_modular_torus_projection() {
+        let mut layer = LayerRouter::zeros();
+        layer.b_route[0] = 1.2;
+        layer.b_route[1] = -0.3;
+        layer.b_route[2] = 2.8;
+
+        let h = Array1::zeros(D_MODEL);
+        let point = layer.project(&h);
+        assert!((point.x - 0.2).abs() < 1e-6);
+        assert!((point.y - 0.7).abs() < 1e-6);
+        assert!((point.z - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_route_and_fold_mutates_selected_position_without_growth() {
+        let mut router = ModelRouter::zeros();
+        let h = Array1::from_vec(vec![0.25; D_MODEL]);
+        let n_before = router.manifold.positions.len();
+
+        let decision = router.route_and_fold(0, &h, 0.4);
+        let n_after = router.manifold.positions.len();
+
+        assert!(decision.expert_id < N_EXPERTS);
+        assert_eq!(n_before, n_after);
     }
 }

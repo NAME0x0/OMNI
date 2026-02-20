@@ -144,10 +144,10 @@ pub struct SafetyDiagnosis {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::anchors::AnchorCategory;
     use super::super::anchors::SafetyAnchor;
     use super::super::halfspace::Halfspace;
-    use super::super::anchors::AnchorCategory;
+    use super::*;
 
     fn make_simple_polytope() -> SafetyPolytope {
         let mut anchors = AnchorSet::new();

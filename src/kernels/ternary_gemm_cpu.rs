@@ -158,22 +158,11 @@ pub fn ternary_swiglu_ffn(
     let x_slice = x.as_slice().unwrap();
 
     // Gate path
-    let gate_raw = ternary_matvec_packed(
-        &w_gate.data,
-        w_gate.rows,
-        w_gate.cols,
-        x_slice,
-        gate_scale,
-    );
+    let gate_raw =
+        ternary_matvec_packed(&w_gate.data, w_gate.rows, w_gate.cols, x_slice, gate_scale);
 
     // Up path
-    let up_raw = ternary_matvec_packed(
-        &w_up.data,
-        w_up.rows,
-        w_up.cols,
-        x_slice,
-        up_scale,
-    );
+    let up_raw = ternary_matvec_packed(&w_up.data, w_up.rows, w_up.cols, x_slice, up_scale);
 
     // SiLU(gate) ⊙ up
     let intermediate: Vec<f32> = gate_raw
@@ -260,7 +249,7 @@ mod tests {
         // Create a small matrix with known trits
         let trits_raw: Vec<i8> = vec![
             1, -1, 0, 1, -1, // row 0
-            0, 1, 1, -1, 0,  // row 1
+            0, 1, 1, -1, 0, // row 1
         ];
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
 
@@ -286,7 +275,7 @@ mod tests {
         let trits_raw: Vec<i8> = vec![
             1, 0, -1, 1, 0, -1, 1, 0, -1, 1, // row 0 (10 cols)
             -1, 1, 0, -1, 1, 0, -1, 1, 0, -1, // row 1
-            0, 0, 1, 1, -1, -1, 0, 0, 1, 1,   // row 2
+            0, 0, 1, 1, -1, -1, 0, 0, 1, 1, // row 2
         ];
         let x: Vec<f32> = (0..10).map(|i| i as f32 * 0.1).collect();
 

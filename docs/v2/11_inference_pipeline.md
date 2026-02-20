@@ -133,8 +133,8 @@ We target **12–14 tok/s** as the conservative baseline.
 | Component | Size (MB) | Notes |
 |-----------|----------|-------|
 | Shared layers (2-bit GPTQ) | 1,707 | Permanent resident |
-| Router weights | 41 | 80 layers × W_route |
-| KV cache (4K tokens) | 320 | Max context length |
+| Router weights | 1.9 | 80 layers × (4096→3) FP16 |
+| KV cache (512-window ×20 GQA) | 42 | Architecture windowed cache budget |
 | PDR states (60 layers) | 120 | Recurrent state |
 | Active expert buffer A | 27 | Double buffer slot |
 | Active expert buffer B | 27 | Double buffer slot |
@@ -142,8 +142,8 @@ We target **12–14 tok/s** as the conservative baseline.
 | Embeddings + LM head | 128 | Shared embedding |
 | SPP anchors + halfspaces | 24 | Safety data |
 | HDM codebook | 5 | Lookup table |
-| **Total** | **2,599** | **63.4% of 4 GB** |
-| **Free** | **1,497** | For OS + driver overlay |
+| **Total** | **2,281** | **55.7% of 4 GB** |
+| **Free** | **1,815** | For OS + driver overlay |
 
 ### 3.2  RAM Layout
 
@@ -165,7 +165,7 @@ model/
 ├── shared/
 │   ├── shared_layers.gptq2     (1.7 GB)
 │   ├── embeddings.bin          (128 MB)
-│   ├── router_weights.bin      (41 MB)
+│   ├── router_weights.bin      (~2 MB)
 │   ├── spp_config.bin          (24 MB)
 │   └── hdm_codebook.bin        (5 MB)
 ├── experts/
@@ -179,7 +179,7 @@ model/
 │   ├── ...
 │   └── delta_127_111.trd       (total: ~20–40 GB)
 └── meta/
-    ├── manifold_positions.json  (128 × 2 floats)
+    ├── manifold_positions.json  (128 × 3 floats)
     ├── expert_clusters.json     (cluster assignments)
     └── model_config.json        (hyperparameters)
 ```
@@ -409,7 +409,7 @@ User sends message → Model generates response → User reads response
 | Component | Parameters | Method | Update budget |
 |-----------|-----------|--------|---------------|
 | PDR W_p matrices | 2M (LoRA rank-4) | JVP + NES | 1.5 s |
-| Router manifold | 256 positions | NES only | 0.5 s |
+| Router manifold | 384 positions | NES only | 0.5 s |
 | HDM codebook | 1000 entries | Binding update | 0.25 s |
 
 ### 7.3  Forgetting Prevention

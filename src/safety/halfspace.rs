@@ -189,8 +189,7 @@ impl HalfspaceSet {
                 })
                 .collect();
             let norm: f32 = normal.iter().map(|v| v * v).sum::<f32>().sqrt();
-            let unit_normal: Vec<f32> =
-                normal.iter().map(|v| v / (norm + 1e-8)).collect();
+            let unit_normal: Vec<f32> = normal.iter().map(|v| v / (norm + 1e-8)).collect();
 
             set.add(
                 Halfspace::new(
@@ -219,11 +218,7 @@ mod tests {
 
     #[test]
     fn test_halfspace_contains() {
-        let h = Halfspace::new(
-            Array1::from_vec(vec![1.0, 0.0]),
-            2.0,
-            "x1<=2",
-        );
+        let h = Halfspace::new(Array1::from_vec(vec![1.0, 0.0]), 2.0, "x1<=2");
         assert!(h.contains(&Array1::from_vec(vec![1.0, 5.0])));
         assert!(h.contains(&Array1::from_vec(vec![2.0, 0.0])));
         assert!(!h.contains(&Array1::from_vec(vec![3.0, 0.0])));
@@ -231,11 +226,7 @@ mod tests {
 
     #[test]
     fn test_halfspace_project() {
-        let h = Halfspace::new(
-            Array1::from_vec(vec![1.0, 0.0]),
-            2.0,
-            "x1<=2",
-        );
+        let h = Halfspace::new(Array1::from_vec(vec![1.0, 0.0]), 2.0, "x1<=2");
         // Point inside → unchanged
         let p = h.project(&Array1::from_vec(vec![1.0, 3.0]));
         assert!((p[0] - 1.0).abs() < 1e-6);
@@ -286,11 +277,7 @@ mod tests {
 
     #[test]
     fn test_signed_distance() {
-        let h = Halfspace::new(
-            Array1::from_vec(vec![0.0, 1.0]),
-            1.0,
-            "x2<=1",
-        );
+        let h = Halfspace::new(Array1::from_vec(vec![0.0, 1.0]), 1.0, "x2<=1");
         assert!(h.signed_distance(&Array1::from_vec(vec![0.0, 0.5])) < 0.0);
         assert!(h.signed_distance(&Array1::from_vec(vec![0.0, 2.0])) > 0.0);
     }
@@ -298,15 +285,9 @@ mod tests {
     #[test]
     fn test_priority_sorting() {
         let mut set = HalfspaceSet::new();
-        set.add(
-            Halfspace::new(Array1::from_vec(vec![1.0]), 1.0, "low").with_priority(1),
-        );
-        set.add(
-            Halfspace::new(Array1::from_vec(vec![1.0]), 1.0, "high").with_priority(10),
-        );
-        set.add(
-            Halfspace::new(Array1::from_vec(vec![1.0]), 1.0, "mid").with_priority(5),
-        );
+        set.add(Halfspace::new(Array1::from_vec(vec![1.0]), 1.0, "low").with_priority(1));
+        set.add(Halfspace::new(Array1::from_vec(vec![1.0]), 1.0, "high").with_priority(10));
+        set.add(Halfspace::new(Array1::from_vec(vec![1.0]), 1.0, "mid").with_priority(5));
 
         let sorted = set.sorted_by_priority();
         assert_eq!(sorted[0].priority, 1);

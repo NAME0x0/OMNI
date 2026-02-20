@@ -24,44 +24,34 @@ and the OS can spike.  A 34 % VRAM margin prevents OOM under load.
 
 | # | Component | Precision | Parameters | MB | Notes |
 |---|-----------|-----------|-----------|-----|-------|
-| 1 | PDR weights (W_p, W_k, W_v, W_q) ×60 | 2-bit | 3.15 B | 788 | 4 matrices × 4096² × 60 layers |
+| 1 | PDR weights (W_p, W_k, W_v, W_q, W_o) ×60 | 2-bit | 3.15 B | 788 | 3 dense d×d + 2 low-rank d×r per layer |
 | 2 | Windowed GQA weights (Q, K, V, O) ×20 | 2-bit | 838 M | 210 | 32 Q-heads, 8 KV-heads, d_h=128 |
 | 3 | Shared FFN weights (W_g, W_u, W_d) ×20 | 2-bit | 2.71 B | 677 | SwiGLU 4096→11008→4096 |
 | 4 | Embedding table (32K × 4096) | INT8 | 131 M | 131 | Tied with output head |
-| 5 | PDR recurrent state (S_t) ×60 | FP16 | — | 240 | 60 × (4096 × 256) × 2 bytes |
+| 5 | PDR recurrent state (S_t) ×60 | FP16 | — | 120 | 60 × (4096 × 256) × 2 bytes |
 | 6 | GQA KV-cache (512-window) ×20 | FP16 | — | 42 | 20 × 8 heads × 128 dim × 512 pos × 2 × 2B |
 | 7 | Expert layer double-buffer | 1.58-bit | 135.3 M | 54 | 2 × one expert-layer (~27 MB each) |
 | 8 | Ternary dequant scratch | FP16 | — | 100 | Unpacked expert layer for compute |
 | 9 | Activation scratch | FP16 | — | 128 | Intermediate activations, GEMM workspace |
 | 10 | RMSNorm scale vectors ×80 | FP16 | 0.66 M | 1.3 | 80 × 2 norms × 4096 × 2B |
-| 11 | Router projection (all layers) | FP16 | 0.49 M | 1.0 | 60 × (4096 → 2) × 2B |
+| 11 | Router projection (all layers) | FP16 | 0.66 M | 1.3 | 80 × (4096 → 2) × 2B |
 | 12 | GPU runtime (driver, cuBLAS, allocator) | — | — | 96 | Conservative estimate |
-| | **TOTAL** | | | **2 468** | |
-| | **Headroom** | | | **1 628** | 39.7 % free |
+| | **TOTAL** | | | **2 348** | |
+| | **Headroom** | | | **1 748** | 42.7 % free |
 
 ### 2.2  Derivations
 
 **PDR weights (item 1):**
-Each PDR layer has 4 projection matrices of size d×d = 4096×4096 = 16.78 M params.
-With a low-rank perspective dimension r=256: W_p is d×d, W_k is d×r, W_v is d×r, W_q is d×r.
-Actually: W_p = 4096×4096 = 16.78M, W_k = 4096×256 = 1.05M, W_v = 4096×256 = 1.05M, W_q = 4096×256 = 1.05M.
-Total per layer = 16.78 + 1.05 + 1.05 + 1.05 = 19.93 M.
+For `d=4096` and `r=256`, each PDR layer has:
+- `W_p`: `d×d` = 16.78M
+- `W_v`: `d×d` = 16.78M
+- `W_o`: `d×d` = 16.78M
+- `W_k`: `d×r` = 1.05M
+- `W_q`: `d×r` = 1.05M
 
-Wait — the state S_t is d×r = 4096×256, so queries need to be r-dimensional to read out via S_t · q_t.
-Corrected: W_p (4096→4096) = 16.78M. W_k (4096→4096) for outer product v·k^T projected to d×r: 
-we need k ∈ R^r, v ∈ R^d. So W_k: 4096→256 = 1.05M, W_v: 4096→4096 = 16.78M, W_q: 4096→256 = 1.05M.
-Actually for the state update S_t = diag(γ) · S_{t-1} + v_t · k_t^T where S ∈ R^{d×r}:
-- k_t ∈ R^r → W_k: 4096×256 = 1.05M
-- v_t ∈ R^d → W_v: 4096×4096 = 16.78M  
-- q_t ∈ R^r → W_q: 4096×256 = 1.05M
-- p_t ∈ R^d → W_p: 4096×4096 = 16.78M
+Per layer: `16.78 + 16.78 + 16.78 + 1.05 + 1.05 = 52.44M` params.
 
-Per layer = 16.78 + 1.05 + 16.78 + 1.05 = 35.66M. Hmm, that's less than the 52.5M quoted earlier.
-
-More precisely, we also need W_o (output projection) d×d = 16.78M, so:
-Per layer: W_p(16.78M) + W_k(1.05M) + W_v(16.78M) + W_q(1.05M) + W_o(16.78M) = 52.44M ≈ 52.5M ✓
-
-At 2-bit: 52.5M × 60 × 0.25 bytes = 787.5 MB ≈ 788 MB ✓
+At 2-bit: `52.44M × 60 × 0.25 bytes = 786.6 MB ≈ 788 MB` ✓
 
 **GQA weights (item 2):**
 - Q: 4096 → 4096 (32 heads × 128) = 16.78M
@@ -86,9 +76,7 @@ Double-buffer = 2 × 27 = 54 MB ✓
 S_t ∈ R^{d×r} = 4096 × 256 = 1,048,576 values × 2 bytes (FP16) = 2.0 MB per layer.
 60 layers × 2.0 = 120.0 MB.
 Plus γ state (4096 × 2B × 60) = 0.48 MB. Total ≈ 120.5 MB.
-
-*Revision*: 120 MB, not 240 MB — the earlier estimate double-counted.
-This frees an additional 120 MB of headroom → **1 748 MB free** (42.7 %).
+Budgeted as **120 MB** in the table (rounded, with γ-state absorbed in slack).
 
 **GQA KV-cache (item 6):**
 Per layer: 8 KV-heads × 128 dim × 512 positions × 2 (K+V) × 2 bytes = 2.097 MB.

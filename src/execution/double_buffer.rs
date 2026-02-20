@@ -6,8 +6,59 @@
 //!
 //! This hides most of the PCIe transfer latency behind computation.
 
-
 use crate::execution::ternary_pack::TernaryExpertFfn;
+
+/// Per-layer expert memory budget in MB.
+pub const EXPERT_LAYER_BUDGET_MB: usize = 27;
+
+/// Total expert double-buffer memory budget in MB.
+pub const EXPERT_DOUBLE_BUFFER_BUDGET_MB: usize = 54;
+
+/// Per-layer expert memory budget in bytes (decimal MB).
+pub const EXPERT_LAYER_BUDGET_BYTES: usize = EXPERT_LAYER_BUDGET_MB * 1_000_000;
+
+/// Total expert double-buffer memory budget in bytes (decimal MB).
+pub const EXPERT_DOUBLE_BUFFER_BUDGET_BYTES: usize = EXPERT_DOUBLE_BUFFER_BUDGET_MB * 1_000_000;
+
+/// Validate execution-memory constants against architecture docs.
+pub fn assert_expert_double_buffer_budget() {
+    assert_eq!(
+        EXPERT_LAYER_BUDGET_MB, 27,
+        "per-layer expert budget must stay at 27 MB",
+    );
+    assert_eq!(
+        EXPERT_DOUBLE_BUFFER_BUDGET_MB, 54,
+        "double-buffer expert budget must stay at 54 MB",
+    );
+    assert_eq!(
+        EXPERT_DOUBLE_BUFFER_BUDGET_MB,
+        2 * EXPERT_LAYER_BUDGET_MB,
+        "double-buffer budget must be exactly 2 x per-layer budget",
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BufferFillSource {
+    Prefetch,
+    Stall,
+}
+
+/// How the current layer acquired its expert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerExpertSource {
+    /// Expert already resident in the active compute buffer.
+    ComputeCache,
+    /// Expert was prepared in the loading buffer by a prefetch.
+    PrefetchedLoadingBuffer,
+    /// Expert had to be loaded synchronously on demand.
+    StallLoad,
+}
+
+/// Expert handle plus acquisition metadata for one layer.
+pub struct LayerExpertRef<'a> {
+    pub expert: &'a TernaryExpertFfn,
+    pub source: LayerExpertSource,
+}
 
 /// Buffer state.
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +86,9 @@ pub struct ExpertBuffer {
 
     /// Buffer identifier (A=0, B=1).
     pub id: usize,
+
+    /// How the current ready payload was filled.
+    fill_source: Option<BufferFillSource>,
 }
 
 impl ExpertBuffer {
@@ -43,6 +97,7 @@ impl ExpertBuffer {
             state: BufferState::Empty,
             expert: None,
             id,
+            fill_source: None,
         }
     }
 
@@ -55,13 +110,19 @@ impl ExpertBuffer {
     pub fn start_loading(&mut self, expert_id: usize) {
         self.state = BufferState::Loading(expert_id);
         self.expert = None;
+        self.fill_source = None;
     }
 
     /// Complete loading — transition from Loading to Ready.
-    pub fn finish_loading(&mut self, expert: TernaryExpertFfn) {
+    pub fn finish_loading(&mut self, expert: TernaryExpertFfn, prefetched: bool) {
         if let BufferState::Loading(id) = self.state {
             self.state = BufferState::Ready(id);
             self.expert = Some(expert);
+            self.fill_source = Some(if prefetched {
+                BufferFillSource::Prefetch
+            } else {
+                BufferFillSource::Stall
+            });
         }
     }
 
@@ -80,6 +141,7 @@ impl ExpertBuffer {
         if let BufferState::InUse(_) = self.state {
             self.state = BufferState::Empty;
             self.expert = None;
+            self.fill_source = None;
         }
     }
 
@@ -87,10 +149,13 @@ impl ExpertBuffer {
     pub fn current_expert(&self) -> Option<usize> {
         match self.state {
             BufferState::Empty => None,
-            BufferState::Loading(id) | BufferState::Ready(id) | BufferState::InUse(id) => {
-                Some(id)
-            }
+            BufferState::Loading(id) | BufferState::Ready(id) | BufferState::InUse(id) => Some(id),
         }
+    }
+
+    /// Whether this ready payload came from a prefetch load.
+    pub fn is_ready_from_prefetch(&self, expert_id: usize) -> bool {
+        self.has_ready(expert_id) && self.fill_source == Some(BufferFillSource::Prefetch)
     }
 }
 
@@ -147,6 +212,7 @@ impl DoubleBufferStats {
 
 impl DoubleBuffer {
     pub fn new() -> Self {
+        assert_expert_double_buffer_budget();
         Self {
             buffer_a: ExpertBuffer::new(0),
             buffer_b: ExpertBuffer::new(1),
@@ -218,7 +284,7 @@ impl DoubleBuffer {
         &mut self,
         expert_id: usize,
         loader: &dyn Fn(usize) -> TernaryExpertFfn,
-    ) -> &TernaryExpertFfn {
+    ) -> LayerExpertRef<'_> {
         self.stats.layers_processed += 1;
 
         // Check compute buffer
@@ -226,16 +292,34 @@ impl DoubleBuffer {
             self.stats.cache_hits += 1;
             let buf = self.compute_buffer_mut();
             buf.acquire();
-            return buf.expert.as_ref().unwrap();
+            let expert = buf.expert.get_or_insert_with(|| loader(expert_id));
+            return LayerExpertRef {
+                expert,
+                source: LayerExpertSource::ComputeCache,
+            };
         }
 
         // Check loading buffer
         if self.loading_buffer().has_ready(expert_id) {
-            self.stats.overlapped += 1;
+            let was_prefetched = self.loading_buffer().is_ready_from_prefetch(expert_id);
+            if was_prefetched {
+                self.stats.overlapped += 1;
+            } else {
+                // Ready-from-loading without prefetch should not inflate overlap stats.
+                self.stats.cache_hits += 1;
+            }
             self.swap();
             let buf = self.compute_buffer_mut();
             buf.acquire();
-            return buf.expert.as_ref().unwrap();
+            let expert = buf.expert.get_or_insert_with(|| loader(expert_id));
+            return LayerExpertRef {
+                expert,
+                source: if was_prefetched {
+                    LayerExpertSource::PrefetchedLoadingBuffer
+                } else {
+                    LayerExpertSource::ComputeCache
+                },
+            };
         }
 
         // Stall: load synchronously into compute buffer
@@ -243,18 +327,18 @@ impl DoubleBuffer {
         let buf = self.compute_buffer_mut();
         buf.start_loading(expert_id);
         let expert = loader(expert_id);
-        buf.finish_loading(expert);
+        buf.finish_loading(expert, false);
         buf.acquire();
-        buf.expert.as_ref().unwrap()
+        let expert = buf.expert.get_or_insert_with(|| loader(expert_id));
+        LayerExpertRef {
+            expert,
+            source: LayerExpertSource::StallLoad,
+        }
     }
 
     /// Start prefetching the next expert into the loading buffer.
     /// This should be called after acquiring the compute buffer.
-    pub fn prefetch(
-        &mut self,
-        next_expert_id: usize,
-        loader: &dyn Fn(usize) -> TernaryExpertFfn,
-    ) {
+    pub fn prefetch(&mut self, next_expert_id: usize, loader: &dyn Fn(usize) -> TernaryExpertFfn) {
         let buf = self.loading_buffer_mut();
         // Don't reload if already loaded
         if buf.has_ready(next_expert_id) {
@@ -262,7 +346,7 @@ impl DoubleBuffer {
         }
         buf.start_loading(next_expert_id);
         let expert = loader(next_expert_id);
-        buf.finish_loading(expert);
+        buf.finish_loading(expert, true);
     }
 
     /// Release the compute buffer after layer computation is done.
@@ -295,7 +379,7 @@ mod tests {
         buf.start_loading(42);
         assert_eq!(buf.state, BufferState::Loading(42));
 
-        buf.finish_loading(make_dummy_expert());
+        buf.finish_loading(make_dummy_expert(), false);
         assert_eq!(buf.state, BufferState::Ready(42));
         assert!(buf.has_ready(42));
 
@@ -320,7 +404,8 @@ mod tests {
     fn test_get_expert_stall() {
         let mut db = DoubleBuffer::new();
         let loader = |_id: usize| make_dummy_expert();
-        let _expert = db.get_expert_for_layer(5, &loader);
+        let layer_expert = db.get_expert_for_layer(5, &loader);
+        assert_eq!(layer_expert.source, LayerExpertSource::StallLoad);
         assert_eq!(db.stats.stalls, 1);
         assert_eq!(db.stats.layers_processed, 1);
     }
@@ -336,10 +421,40 @@ mod tests {
 
         // Re-load same expert into compute buffer
         db.compute_buffer_mut().start_loading(5);
-        db.compute_buffer_mut().finish_loading(make_dummy_expert());
+        db.compute_buffer_mut()
+            .finish_loading(make_dummy_expert(), false);
 
         // Second access: cache hit
-        let _ = db.get_expert_for_layer(5, &loader);
+        let layer_expert = db.get_expert_for_layer(5, &loader);
+        assert_eq!(layer_expert.source, LayerExpertSource::ComputeCache);
         assert_eq!(db.stats.cache_hits, 1);
+    }
+
+    #[test]
+    fn test_get_expert_prefetched_loading_hit() {
+        let mut db = DoubleBuffer::new();
+        let loader = |_id: usize| make_dummy_expert();
+
+        db.prefetch(9, &loader);
+        let layer_expert = db.get_expert_for_layer(9, &loader);
+
+        assert_eq!(
+            layer_expert.source,
+            LayerExpertSource::PrefetchedLoadingBuffer
+        );
+        assert_eq!(db.stats.overlapped, 1);
+        assert_eq!(db.stats.stalls, 0);
+    }
+
+    #[test]
+    fn test_expert_double_buffer_budget_constants() {
+        assert_expert_double_buffer_budget();
+        assert_eq!(EXPERT_LAYER_BUDGET_MB, 27);
+        assert_eq!(EXPERT_DOUBLE_BUFFER_BUDGET_MB, 54);
+        assert_eq!(EXPERT_DOUBLE_BUFFER_BUDGET_MB, 2 * EXPERT_LAYER_BUDGET_MB);
+        assert_eq!(
+            EXPERT_DOUBLE_BUFFER_BUDGET_BYTES,
+            2 * EXPERT_LAYER_BUDGET_BYTES
+        );
     }
 }

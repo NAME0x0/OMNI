@@ -7,4 +7,6 @@
 //! - **SYCL**: Intel GPU kernels (feature `sycl`)
 
 pub mod kernel_dispatch;
+#[cfg(feature = "native-manifold")]
+pub mod manifold_native;
 pub mod ternary_gemm_cpu;

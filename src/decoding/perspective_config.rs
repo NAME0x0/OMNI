@@ -170,7 +170,11 @@ fn dropout_mask(n: usize, p: f32, seed: u64) -> Array1<f32> {
         .map(|_| {
             state = xorshift64(state);
             let u = (state as f32) / (u64::MAX as f32);
-            if u < p { 0.0 } else { 1.0 }
+            if u < p {
+                0.0
+            } else {
+                1.0
+            }
         })
         .collect();
     Array1::from_vec(values)

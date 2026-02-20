@@ -187,10 +187,7 @@ pub fn majority_vote(vectors: &[&HyperVector]) -> HyperVector {
     let mut result = HyperVector::zeros();
 
     for bit_idx in 0..HDM_DIM {
-        let count: usize = vectors
-            .iter()
-            .filter(|v| v.get_bit(bit_idx))
-            .count();
+        let count: usize = vectors.iter().filter(|v| v.get_bit(bit_idx)).count();
 
         if count > threshold || (count == threshold && n % 2 == 0 && vectors[0].get_bit(bit_idx)) {
             result.set_bit(bit_idx, true);
@@ -289,12 +286,7 @@ mod tests {
         let result = majority_vote(&[&a, &a, &b]);
         let sim_a = result.similarity(&a);
         let sim_b = result.similarity(&b);
-        assert!(
-            sim_a > sim_b,
-            "sim_a={}, sim_b={}",
-            sim_a,
-            sim_b
-        );
+        assert!(sim_a > sim_b, "sim_a={}, sim_b={}", sim_a, sim_b);
     }
 
     #[test]

@@ -71,8 +71,11 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
-      - name: Run tests
+      - name: Run tests (default features)
         run: cargo test --verbose -- --test-threads=1
+
+      - name: Run tests (all features)
+        run: cargo test --all-features --verbose -- --test-threads=1
 
   # ──────────────────────────────────────────────
   # Security audit

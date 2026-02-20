@@ -60,11 +60,7 @@ impl EpisodicMemory {
     }
 
     /// Retrieve the top-k most similar traces to a query vector.
-    pub fn retrieve(
-        &self,
-        query: &HyperVector,
-        k: usize,
-    ) -> Vec<RetrievalResult> {
+    pub fn retrieve(&self, query: &HyperVector, k: usize) -> Vec<RetrievalResult> {
         let mut scored: Vec<RetrievalResult> = self
             .traces
             .iter()
@@ -89,11 +85,7 @@ impl EpisodicMemory {
     }
 
     /// Retrieve traces above a similarity threshold.
-    pub fn retrieve_threshold(
-        &self,
-        query: &HyperVector,
-        threshold: f64,
-    ) -> Vec<RetrievalResult> {
+    pub fn retrieve_threshold(&self, query: &HyperVector, threshold: f64) -> Vec<RetrievalResult> {
         self.traces
             .iter()
             .enumerate()
@@ -192,14 +184,8 @@ impl WorkingMemory {
         self.slots
             .iter()
             .enumerate()
-            .filter_map(|(i, slot)| {
-                slot.as_ref()
-                    .map(|t| (i, t.vector.similarity(query)))
-            })
-            .max_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .filter_map(|(i, slot)| slot.as_ref().map(|t| (i, t.vector.similarity(query))))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
     }
 
     /// Clear a slot.
@@ -271,11 +257,7 @@ mod tests {
     fn test_threshold_retrieval() {
         let mut mem = EpisodicMemory::new(100);
         let target = HyperVector::random(42);
-        mem.store(MemoryTrace::from_vector(
-            target.clone(),
-            "target",
-            0,
-        ));
+        mem.store(MemoryTrace::from_vector(target.clone(), "target", 0));
         // Add noise traces
         for i in 1..10 {
             mem.store(make_trace(i * 1000, &format!("noise{}", i), i));

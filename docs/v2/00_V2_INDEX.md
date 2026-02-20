@@ -23,9 +23,9 @@
    attention layers provide exact recall when needed.
 
 3. **Experts live on a manifold.**
-   128 experts are embedded on a 2-D torus.  Nearby experts share most of
+   128 experts are embedded on a 3-D torus.  Nearby experts share most of
    their weights, enabling *delta streaming* (transfer only the diff) and
-   smooth interpolation in expert space.
+   fold-based manifold updates in expert space.
 
 4. **Memory is holographic.**
    Holographic Distributed Memory (HDM) encodes associations in 10 000-bit
@@ -53,8 +53,8 @@
 
 | Metric | Value |
 |--------|-------|
-| Total parameters | **1.05 T** (128 experts × 8.12 B + 7.7 B shared) |
-| Active parameters / token | **15.8 B** (7.7 B shared + 8.12 B expert, top-1) |
+| Total parameters | **1.05 T** (128 experts × 8.12 B + 6.83 B shared) |
+| Active parameters / token | **14.95 B** (6.83 B shared + 8.12 B expert, top-1) |
 | Weight precision | Ternary {-1, 0, +1} = 1.58 bit (natively trained) |
 | Shared-layer precision | 2-bit (GPTQ-class) |
 | Layers | 80 (60 PDR + 20 windowed GQA) |
@@ -63,7 +63,7 @@
 | FFN intermediate | 11 008 (SwiGLU) |
 | Attention heads | 32 query, 8 KV (GQA, windowed layers only) |
 | Vocabulary | 32 768 (BPE) |
-| VRAM budget | 2 684 MB used / 4 096 MB (34.5 % slack) |
+| VRAM budget | 2 348 MB used / 4 096 MB (42.7 % slack) |
 | RAM budget | ~26 GB used / 32 GB (6.6 GB headroom) |
 | NVMe footprint | ~205 GB (all 128 experts, ternary-packed) |
 | Decode throughput | 12–14 tok/s (PCIe-bound pipeline) |

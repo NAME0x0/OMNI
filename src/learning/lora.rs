@@ -55,8 +55,7 @@ impl LoraAdapter {
             })
             .collect();
 
-        let a = Array2::from_shape_vec((LORA_RANK, d_in), a_values)
-            .expect("LoRA A shape mismatch");
+        let a = Array2::from_shape_vec((LORA_RANK, d_in), a_values).expect("LoRA A shape mismatch");
         let b = Array2::zeros((d_out, LORA_RANK));
 
         Self {
@@ -149,17 +148,9 @@ impl LoraBank {
     }
 
     /// Create with Kaiming initialization.
-    pub fn kaiming(
-        count: usize,
-        d_in: usize,
-        d_out: usize,
-        alpha: f32,
-        base_seed: u64,
-    ) -> Self {
+    pub fn kaiming(count: usize, d_in: usize, d_out: usize, alpha: f32, base_seed: u64) -> Self {
         let adapters = (0..count)
-            .map(|i| {
-                LoraAdapter::kaiming_init(d_in, d_out, alpha, base_seed + i as u64)
-            })
+            .map(|i| LoraAdapter::kaiming_init(d_in, d_out, alpha, base_seed + i as u64))
             .collect();
         Self { adapters }
     }

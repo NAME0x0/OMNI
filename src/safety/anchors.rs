@@ -149,10 +149,7 @@ impl AnchorSet {
         }
 
         // Simple projection: weighted average by inverse distance
-        let mut weights: Vec<f32> = nearest
-            .iter()
-            .map(|(_, d)| 1.0 / (d + 1e-6))
-            .collect();
+        let mut weights: Vec<f32> = nearest.iter().map(|(_, d)| 1.0 / (d + 1e-6)).collect();
         let sum: f32 = weights.iter().sum();
         for w in &mut weights {
             *w /= sum;
@@ -249,14 +246,9 @@ mod tests {
             AnchorCategory::Helpful,
         );
         // Same direction → 1.0
-        assert!(
-            (a.cosine_similarity(&Array1::from_vec(vec![2.0, 0.0])) - 1.0).abs()
-                < 1e-5
-        );
+        assert!((a.cosine_similarity(&Array1::from_vec(vec![2.0, 0.0])) - 1.0).abs() < 1e-5);
         // Orthogonal → 0.0
-        assert!(
-            a.cosine_similarity(&Array1::from_vec(vec![0.0, 1.0])).abs() < 1e-5
-        );
+        assert!(a.cosine_similarity(&Array1::from_vec(vec![0.0, 1.0])).abs() < 1e-5);
     }
 
     #[test]

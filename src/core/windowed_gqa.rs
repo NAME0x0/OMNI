@@ -1,15 +1,16 @@
-//! Windowed Grouped-Query Attention (GQA) — used in 20 of 80 layers.
+//! Windowed Grouped-Query Attention (GQA).
 //!
-//! Standard multi-head attention with two optimisations:
-//! 1. **Windowed**: Only attend to the last `WINDOW` tokens (not full context)
-//! 2. **Grouped queries**: 32 query heads share 8 KV heads (4:1 ratio)
-//!
-//! This keeps KV cache memory bounded: 512 × 8 × 128 × 4 bytes = 2 MB per layer.
+//! Optimisations:
+//! 1. Windowed attention over last `GQA_WINDOW` tokens.
+//! 2. Grouped queries: `GQA_Q_HEADS` query heads share `GQA_KV_HEADS` KV heads.
+//! 3. RoPE positional encoding on q/k before attention scoring.
 
 use ndarray::{s, Array1, Array2, Array3};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{D_MODEL, GQA_KV_HEADS, GQA_Q_HEADS, GQA_WINDOW, HEAD_DIM};
+
+const ROPE_BASE: f32 = 10_000.0;
 
 /// KV cache for a single GQA layer (ring buffer).
 #[derive(Clone)]
@@ -25,6 +26,9 @@ pub struct KVCache {
 
     /// Number of valid entries (up to WINDOW).
     pub len: usize,
+
+    /// Number of KV entries ever inserted (absolute token position tracker).
+    pub tokens_seen: u64,
 }
 
 impl KVCache {
@@ -34,22 +38,25 @@ impl KVCache {
             values: Array3::zeros((GQA_WINDOW, GQA_KV_HEADS, HEAD_DIM)),
             pos: 0,
             len: 0,
+            tokens_seen: 0,
         }
+    }
+
+    /// Absolute position for the next token that will be inserted.
+    pub fn next_position(&self) -> usize {
+        self.tokens_seen.min(usize::MAX as u64) as usize
     }
 
     /// Insert a new KV pair.
     pub fn insert(&mut self, k: &Array2<f32>, v: &Array2<f32>) {
         // k, v: [kv_heads, head_dim]
-        self.keys
-            .slice_mut(s![self.pos, .., ..])
-            .assign(k);
-        self.values
-            .slice_mut(s![self.pos, .., ..])
-            .assign(v);
+        self.keys.slice_mut(s![self.pos, .., ..]).assign(k);
+        self.values.slice_mut(s![self.pos, .., ..]).assign(v);
         self.pos = (self.pos + 1) % GQA_WINDOW;
         if self.len < GQA_WINDOW {
             self.len += 1;
         }
+        self.tokens_seen = self.tokens_seen.saturating_add(1);
     }
 
     /// Get valid keys: [len, kv_heads, head_dim]
@@ -90,6 +97,7 @@ impl KVCache {
         self.values.fill(0.0);
         self.pos = 0;
         self.len = 0;
+        self.tokens_seen = 0;
     }
 
     /// Memory footprint in bytes.
@@ -107,16 +115,16 @@ impl Default for KVCache {
 /// Weights for a single GQA attention layer.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GqaLayer {
-    /// Query projection: W_q ∈ R^{(q_heads * head_dim) × d_model}
+    /// Query projection: `W_q in R^{(q_heads * head_dim) x d_model}`
     pub w_q: Array2<f32>,
 
-    /// Key projection: W_k ∈ R^{(kv_heads * head_dim) × d_model}
+    /// Key projection: `W_k in R^{(kv_heads * head_dim) x d_model}`
     pub w_k: Array2<f32>,
 
-    /// Value projection: W_v ∈ R^{(kv_heads * head_dim) × d_model}
+    /// Value projection: `W_v in R^{(kv_heads * head_dim) x d_model}`
     pub w_v: Array2<f32>,
 
-    /// Output projection: W_o ∈ R^{d_model × (q_heads * head_dim)}
+    /// Output projection: `W_o in R^{d_model x (q_heads * head_dim)}`
     pub w_o: Array2<f32>,
 
     /// RMSNorm scale for pre-norm.
@@ -143,6 +151,15 @@ impl GqaLayer {
 
     /// Single-token forward pass with KV cache update.
     pub fn forward_step(&self, h: &Array1<f32>, cache: &mut KVCache) -> Array1<f32> {
+        if h.len() != D_MODEL {
+            return h.clone();
+        }
+
+        if GQA_KV_HEADS == 0 || GQA_Q_HEADS % GQA_KV_HEADS != 0 {
+            return h.clone();
+        }
+        let group_size = GQA_Q_HEADS / GQA_KV_HEADS;
+
         let h_norm = rms_norm(h, &self.rms_scale);
 
         // Project Q, K, V
@@ -150,53 +167,64 @@ impl GqaLayer {
         let k_flat = self.w_k.dot(&h_norm); // [kv_heads * head_dim]
         let v_flat = self.w_v.dot(&h_norm); // [kv_heads * head_dim]
 
-        // Reshape K, V to [kv_heads, head_dim] and insert into cache
-        let k_2d = k_flat.into_shape_with_order((GQA_KV_HEADS, HEAD_DIM)).unwrap();
-        let v_2d = v_flat.into_shape_with_order((GQA_KV_HEADS, HEAD_DIM)).unwrap();
-        cache.insert(&k_2d, &v_2d);
+        // Checked reshapes; on failure, fallback to residual path.
+        let mut q_2d = match reshape_heads(q_flat, GQA_Q_HEADS, HEAD_DIM) {
+            Some(v) => v,
+            None => return h.clone(),
+        };
+        let mut k_2d = match reshape_heads(k_flat, GQA_KV_HEADS, HEAD_DIM) {
+            Some(v) => v,
+            None => return h.clone(),
+        };
+        let v_2d = match reshape_heads(v_flat, GQA_KV_HEADS, HEAD_DIM) {
+            Some(v) => v,
+            None => return h.clone(),
+        };
 
-        // Reshape Q to [q_heads, head_dim]
-        let q_2d = q_flat.into_shape_with_order((GQA_Q_HEADS, HEAD_DIM)).unwrap();
+        // RoPE on current-token q/k before cache insert / scoring.
+        let token_pos = cache.next_position();
+        apply_rope(&mut q_2d, token_pos);
+        apply_rope(&mut k_2d, token_pos);
+
+        // Insert rope-transformed key and value into cache.
+        cache.insert(&k_2d, &v_2d);
 
         // Get cached K, V: [cache_len, kv_heads, head_dim]
         let cached_k = cache.get_keys();
         let cached_v = cache.get_values();
         let cache_len = cached_k.shape()[0];
 
-        // Compute attention for each query head
-        let group_size = GQA_Q_HEADS / GQA_KV_HEADS; // 4
+        // Compute attention for each query head.
         let mut attn_out = Array1::zeros(GQA_Q_HEADS * HEAD_DIM);
+        let scale = (HEAD_DIM as f32).sqrt();
 
         for qh in 0..GQA_Q_HEADS {
             let kv_idx = qh / group_size; // Which KV head this Q head uses
             let q = q_2d.row(qh); // [head_dim]
 
-            // Compute attention scores: q · k^T / sqrt(d)
-            let scale = (HEAD_DIM as f32).sqrt();
+            // Scores: q dot k^T / sqrt(d)
             let mut scores = Array1::zeros(cache_len);
             for t in 0..cache_len {
                 let k_t = cached_k.slice(s![t, kv_idx, ..]);
                 scores[t] = q.dot(&k_t) / scale;
             }
 
-            // Softmax
+            // Softmax + weighted value sum.
             let scores = softmax(&scores);
-
-            // Weighted sum of values
             let mut head_out = Array1::zeros(HEAD_DIM);
             for t in 0..cache_len {
                 let v_t = cached_v.slice(s![t, kv_idx, ..]);
                 head_out = head_out + &(v_t.to_owned() * scores[t]);
             }
 
-            // Place into output
+            // Write head output.
             let start = qh * HEAD_DIM;
             for d in 0..HEAD_DIM {
                 attn_out[start + d] = head_out[d];
             }
         }
 
-        // Output projection + residual
+        // Output projection + residual.
         let output = self.w_o.dot(&attn_out);
         h + &output
     }
@@ -209,6 +237,46 @@ impl GqaLayer {
         let o = D_MODEL * GQA_Q_HEADS * HEAD_DIM;
         let rms = D_MODEL;
         q + k + v + o + rms
+    }
+}
+
+/// Checked reshape of a flat `[rows * cols]` vector into `[rows, cols]`.
+fn reshape_heads(x: Array1<f32>, rows: usize, cols: usize) -> Option<Array2<f32>> {
+    if x.len() != rows * cols {
+        return None;
+    }
+    x.into_shape_with_order((rows, cols)).ok()
+}
+
+/// Apply RoPE in-place to `[heads, head_dim]`.
+fn apply_rope(x: &mut Array2<f32>, position: usize) {
+    let pairs = HEAD_DIM / 2;
+    if pairs == 0 {
+        return;
+    }
+
+    let pos = position as f32;
+    let mut cos_cache = vec![0.0; pairs];
+    let mut sin_cache = vec![0.0; pairs];
+
+    for i in 0..pairs {
+        let exponent = (2 * i) as f32 / HEAD_DIM as f32;
+        let theta = pos / ROPE_BASE.powf(exponent);
+        cos_cache[i] = theta.cos();
+        sin_cache[i] = theta.sin();
+    }
+
+    for h in 0..x.nrows() {
+        for i in 0..pairs {
+            let i0 = 2 * i;
+            let i1 = i0 + 1;
+            let a = x[[h, i0]];
+            let b = x[[h, i1]];
+            let cos_theta = cos_cache[i];
+            let sin_theta = sin_cache[i];
+            x[[h, i0]] = a * cos_theta - b * sin_theta;
+            x[[h, i1]] = a * sin_theta + b * cos_theta;
+        }
     }
 }
 
@@ -225,9 +293,11 @@ fn softmax(x: &Array1<f32>) -> Array1<f32> {
     if x.is_empty() {
         return x.clone();
     }
-    let max_val = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+    let max_val = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exp = x.mapv(|v| (v - max_val).exp());
     let sum = exp.sum();
+
     if sum > 0.0 {
         exp / sum
     } else {
@@ -270,6 +340,7 @@ mod tests {
         cache.insert(&k, &v);
         assert_eq!(cache.len, 1);
         assert_eq!(cache.pos, 1);
+        assert_eq!(cache.tokens_seen, 1);
     }
 
     #[test]
@@ -282,6 +353,15 @@ mod tests {
         }
         assert_eq!(cache.len, GQA_WINDOW);
         assert_eq!(cache.pos, 5);
+        assert_eq!(cache.tokens_seen, (GQA_WINDOW + 5) as u64);
+    }
+
+    #[test]
+    fn test_rope_position_zero_identity() {
+        let mut q = Array2::ones((GQA_Q_HEADS, HEAD_DIM));
+        let baseline = q.clone();
+        apply_rope(&mut q, 0);
+        assert_eq!(q, baseline);
     }
 
     #[test]

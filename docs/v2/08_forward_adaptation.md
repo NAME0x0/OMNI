@@ -131,12 +131,13 @@ is sufficient for:
 
 ### 3.1  What Evolves
 
-The 128 expert positions on the torus: $\{z_i = (\theta_i, \phi_i)\}_{i=1}^{128}$.
-Total parameters: 256 scalars (128 × 2D coordinates).
+The 128 expert positions on the torus: $\{z_i = (\theta_i, \phi_i, \psi_i)\}_{i=1}^{128}$.
+Total parameters: 384 scalars (128 × 3D coordinates).
 
 These positions determine which expert is "nearest" to any given routing
 query.  By moving experts on the manifold, we change the model's routing
-behaviour without touching any weights.
+behaviour without touching any weights. Updates are applied as wrapped fold
+steps on the existing coordinates (no append of new points).
 
 ### 3.2  Natural Evolution Strategies (NES)
 
@@ -163,7 +164,7 @@ Input: expert positions z = {z_1, ..., z_128}
 
 | Resource | Cost |
 |----------|------|
-| Perturbation storage | 16 × 256 × 4 bytes = 16 KB |
+| Perturbation storage | 16 × 384 × 4 bytes = 24 KB |
 | Forward passes per update | 16 (one per perturbation) |
 | Wall time per update | 16 × 93 ms = ~1.5 s |
 | Update frequency | Every 50 tokens |
@@ -247,7 +248,7 @@ to allow meaningful adaptation.
 | Prompt tuning | O(prompt × d) | Yes | Virtual tokens | None |
 | ICL (in-context) | O(examples × d) | No | None | None but ephemeral |
 | **FMEA-LoRA** | **11 MB** | **No** | **2M adapter params** | **Low (isolated)** |
-| **FMEA-NES** | **16 KB** | **No** | **256 routing coords** | **Low (anchored)** |
+| **FMEA-NES** | **24 KB** | **No** | **384 routing coords** | **Low (anchored)** |
 
 ---
 

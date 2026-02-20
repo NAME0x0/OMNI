@@ -6,7 +6,7 @@
 //! ## Novel Components
 //!
 //! 1. **PDR** — Perspective Decay Recurrence (O(1) sequence processing)
-//! 2. **Manifold Routing** — Expert selection on a 2D flat torus
+//! 2. **Manifold Routing** — Expert selection on a 3D flat torus
 //! 3. **Ternary Execution** — Natively {-1, 0, +1} weights at 1.58 bits/param
 //! 4. **HDM** — Holographic Distributed Memory (hyperdimensional long-term memory)
 //! 5. **MPD** — Multi-Perspective Decoding (4-perspective calibrated generation)
@@ -71,9 +71,16 @@ pub mod config {
     /// Experts selected per token (top-k).
     pub const TOP_K: usize = 1;
 
-    /// Manifold grid dimensions (N_EXPERTS = GRID_ROWS × GRID_COLS).
-    pub const GRID_ROWS: usize = 16;
-    pub const GRID_COLS: usize = 8;
+    /// Manifold torus dimension.
+    pub const MANIFOLD_DIM: usize = 3;
+
+    /// Manifold lattice dimensions (N_EXPERTS = GRID_X × GRID_Y × GRID_Z).
+    pub const GRID_X: usize = 8;
+    pub const GRID_Y: usize = 4;
+    pub const GRID_Z: usize = 4;
+
+    /// Compile-time check for manifold lattice sizing.
+    const _: [(); N_EXPERTS] = [(); GRID_X * GRID_Y * GRID_Z];
 
     /// HDM hypervector dimension.
     pub const HDM_DIM: usize = 10000;

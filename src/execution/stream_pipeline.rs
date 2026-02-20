@@ -18,7 +18,9 @@ use crate::config;
 use crate::core::model::{LayerKind, PerspectiveModel};
 use crate::core::pdr_state::PdrStateBank;
 use crate::core::windowed_gqa::KVCacheBank;
-use crate::execution::double_buffer::{DoubleBuffer, DoubleBufferStats};
+use crate::execution::double_buffer::{
+    DoubleBuffer, DoubleBufferStats, LayerExpertSource, EXPERT_LAYER_BUDGET_BYTES,
+};
 use crate::execution::ternary_pack::TernaryExpertFfn;
 use crate::routing::router::{ModelRouter, RoutingDecision};
 
@@ -134,6 +136,7 @@ impl StreamPipeline {
 
         let mut routing_trace = Vec::with_capacity(config::N_LAYERS);
         let mut load_trace = Vec::with_capacity(config::N_LAYERS);
+        let mut prefetched_for_layer: Vec<Option<usize>> = vec![None; config::N_LAYERS];
 
         for layer_idx in 0..config::N_LAYERS {
             // --- Route ---
@@ -141,20 +144,28 @@ impl StreamPipeline {
             let expert_id = decision.expert_id;
             routing_trace.push(decision);
 
-            // --- Load expert via double-buffer ---
-            let was_cached = provider.is_cached(expert_id);
-            let loader = |eid: usize| provider.load_expert(eid);
+            if self.prefetch_enabled {
+                if let Some(predicted_expert_id) = prefetched_for_layer[layer_idx] {
+                    if predicted_expert_id == expert_id {
+                        self.prefetch_hits += 1;
+                    } else {
+                        self.prefetch_misses += 1;
+                    }
+                }
+            }
 
-            let expert = self.double_buffer.get_expert_for_layer(expert_id, &loader);
+            // --- Load expert via double-buffer ---
+            let loader = |eid: usize| provider.load_expert(eid);
+            let layer_expert = self.double_buffer.get_expert_for_layer(expert_id, &loader);
+            let expert_source = layer_expert.source;
+            let expert = layer_expert.expert;
 
             // --- Compute shared layer (PDR or GQA) ---
             match &model.layers[layer_idx] {
                 LayerKind::Pdr(pdr_layer) => {
                     let pdr_idx = if layer_idx < config::N_LAYERS {
                         // Count PDR layers before this one
-                        (0..layer_idx)
-                            .filter(|&i| config::is_pdr_layer(i))
-                            .count()
+                        (0..layer_idx).filter(|&i| config::is_pdr_layer(i)).count()
                     } else {
                         0
                     };
@@ -164,9 +175,7 @@ impl StreamPipeline {
                 }
                 LayerKind::Gqa(gqa_layer) => {
                     let gqa_idx = if layer_idx < config::N_LAYERS {
-                        (0..layer_idx)
-                            .filter(|&i| !config::is_pdr_layer(i))
-                            .count()
+                        (0..layer_idx).filter(|&i| !config::is_pdr_layer(i)).count()
                     } else {
                         0
                     };
@@ -177,21 +186,30 @@ impl StreamPipeline {
             }
 
             // --- Compute expert FFN (ternary, zero-multiply) ---
-            h = Array1::from_vec(expert.forward(h.as_slice().unwrap()));
+            let expert_out = if let Some(input) = h.as_slice() {
+                expert.forward(input)
+            } else {
+                let tmp = h.to_vec();
+                expert.forward(&tmp)
+            };
+            h = Array1::from_vec(expert_out);
 
             // --- Record load event ---
+            let was_prefetched =
+                matches!(expert_source, LayerExpertSource::PrefetchedLoadingBuffer);
             load_trace.push(LayerLoadEvent {
                 layer_idx,
                 expert_id,
-                was_prefetched: !was_cached
-                    && self.double_buffer.stats.overlapped > 0,
-                was_cached,
+                was_prefetched,
+                was_cached: !matches!(expert_source, LayerExpertSource::StallLoad),
             });
 
             // --- Prefetch next layer's predicted expert ---
             if self.prefetch_enabled && layer_idx + 1 < config::N_LAYERS {
-                let predicted = router.predict_ahead(&h, layer_idx);
+                let next_layer = layer_idx + 1;
+                let predicted = router.predict_ahead(&h, next_layer);
                 let next_eid = predicted.expert_id;
+                prefetched_for_layer[next_layer] = Some(next_eid);
                 self.double_buffer.prefetch(next_eid, &loader);
             }
 
@@ -230,6 +248,16 @@ impl StreamPipeline {
         } else {
             self.prefetch_hits as f64 / total as f64
         }
+    }
+
+    /// Total prediction-ahead hits across processed tokens.
+    pub fn prefetch_hits(&self) -> u64 {
+        self.prefetch_hits
+    }
+
+    /// Total prediction-ahead misses across processed tokens.
+    pub fn prefetch_misses(&self) -> u64 {
+        self.prefetch_misses
     }
 }
 
@@ -289,38 +317,41 @@ pub struct ThroughputEstimator {
 impl ThroughputEstimator {
     /// Create estimator with default PERSPECTIVE parameters.
     pub fn default_perspective() -> Self {
-        // Expert FFN: 3 matrices × 4096 × 11008 × 0.2 bytes/param
-        let expert_bytes = 3 * 4096 * 11008 * 2 / 10; // ~2.7 MB in ternary
         Self {
-            nvme_bandwidth_gbps: 7.0,  // Gen4 NVMe
-            pcie_bandwidth_gbps: 14.0, // PCIe 4.0 x16
-            expert_size_bytes: expert_bytes as u64,
-            compute_time_ms: 3.1, // from docs
+            nvme_bandwidth_gbps: 7.0,                            // Gen4 NVMe
+            pcie_bandwidth_gbps: 14.0,                           // PCIe 4.0 x16
+            expert_size_bytes: EXPERT_LAYER_BUDGET_BYTES as u64, // 27 MB per layer
+            compute_time_ms: 0.03, // ternary FFN kernel time per layer
             prefetch_hit_rate: 0.87,
         }
     }
 
-    /// Estimate tokens per second.
-    pub fn estimate_tok_per_sec(&self) -> f64 {
-        let load_time_ms = self.expert_size_bytes as f64
-            / (self.nvme_bandwidth_gbps * 1e6); // ms
+    /// Estimate effective layer time in ms:
+    /// max(layer compute, non-overlapped layer load).
+    pub fn estimate_layer_time_ms(&self) -> f64 {
+        let load_time_ms = self.expert_size_bytes as f64 / (self.nvme_bandwidth_gbps * 1e6); // ms
 
         // Effective load time accounts for prefetch hits (fully hidden)
-        let effective_load_ms =
-            load_time_ms * (1.0 - self.prefetch_hit_rate);
+        let effective_load_ms = load_time_ms * (1.0 - self.prefetch_hit_rate);
 
-        // Total per-layer time = max(compute, effective_load)
-        let per_layer_ms = self.compute_time_ms.max(effective_load_ms);
+        self.compute_time_ms.max(effective_load_ms)
+    }
 
-        // Total per-token time across 80 layers
-        let per_token_ms = per_layer_ms * config::N_LAYERS as f64;
+    /// Estimate per-token time in ms across all model layers.
+    pub fn estimate_token_time_ms(&self) -> f64 {
+        self.estimate_layer_time_ms() * config::N_LAYERS as f64
+    }
+
+    /// Estimate tokens per second.
+    pub fn estimate_tok_per_sec(&self) -> f64 {
+        let per_token_ms = self.estimate_token_time_ms();
 
         1000.0 / per_token_ms
     }
 
     /// Estimate end-to-end latency for one token (ms).
     pub fn estimate_latency_ms(&self) -> f64 {
-        1000.0 / self.estimate_tok_per_sec()
+        self.estimate_token_time_ms()
     }
 }
 
@@ -350,10 +381,7 @@ mod tests {
 
     #[test]
     fn test_in_memory_provider() {
-        let experts = vec![
-            make_dummy_expert(8, 16),
-            make_dummy_expert(8, 16),
-        ];
+        let experts = vec![make_dummy_expert(8, 16), make_dummy_expert(8, 16)];
         let provider = InMemoryExpertProvider { experts };
         assert_eq!(provider.num_experts(), 2);
         assert!(provider.is_cached(0));
@@ -367,6 +395,10 @@ mod tests {
         // Should be positive and reasonable
         assert!(tps > 0.0);
         assert!(tps < 1000.0); // sanity bound
+        assert_eq!(est.compute_time_ms, 0.03);
+        assert_eq!(est.expert_size_bytes, EXPERT_LAYER_BUDGET_BYTES as u64);
+        assert!(est.estimate_layer_time_ms() >= est.compute_time_ms);
+        assert_eq!(est.estimate_latency_ms(), est.estimate_token_time_ms());
     }
 
     #[test]
@@ -380,6 +412,17 @@ mod tests {
     fn test_pipeline_with_prefetch_toggle() {
         let pipe = StreamPipeline::new().with_prefetch(false);
         assert!(!pipe.prefetch_enabled);
+    }
+
+    #[test]
+    fn test_prefetch_hit_rate_accounting() {
+        let mut pipe = StreamPipeline::new();
+        pipe.prefetch_hits = 7;
+        pipe.prefetch_misses = 3;
+
+        assert_eq!(pipe.prefetch_hits(), 7);
+        assert_eq!(pipe.prefetch_misses(), 3);
+        assert!((pipe.prefetch_hit_rate() - 0.7).abs() < 1e-9);
     }
 
     #[test]

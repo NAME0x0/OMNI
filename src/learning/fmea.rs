@@ -17,9 +17,10 @@
 
 use ndarray::{Array1, Array2};
 
+use super::evolutionary::{NesConfig, NesOptimizer, NesSample};
 use super::jvp::TangentVector;
 use super::lora::{LoraBank, LORA_RANK};
-use super::evolutionary::{NesConfig, NesOptimizer, NesSample};
+use crate::config::MANIFOLD_DIM;
 
 /// FMEA configuration.
 #[derive(Clone, Debug)]
@@ -79,6 +80,9 @@ pub struct FmeaEngine {
     /// Statistics.
     pub stats: FmeaStats,
 
+    /// Internal routing parameter shadow used for scheduled NES updates.
+    routing_shadow: Array1<f32>,
+
     /// PRNG state.
     rng_state: u64,
 }
@@ -111,17 +115,8 @@ pub struct FmeaStepResult {
 
 impl FmeaEngine {
     /// Create a new FMEA engine.
-    pub fn new(
-        config: FmeaConfig,
-        n_experts: usize,
-        d_model: usize,
-    ) -> Self {
-        let lora_bank = LoraBank::new(
-            n_experts,
-            d_model,
-            d_model,
-            config.lora_alpha,
-        );
+    pub fn new(config: FmeaConfig, n_experts: usize, d_model: usize) -> Self {
+        let lora_bank = LoraBank::new(n_experts, d_model, d_model, config.lora_alpha);
         let nes_optimizer = NesOptimizer::new(config.nes_config.clone());
 
         Self {
@@ -131,6 +126,7 @@ impl FmeaEngine {
             step: 0,
             loss_ema: 0.0,
             stats: FmeaStats::default(),
+            routing_shadow: Array1::zeros(n_experts * MANIFOLD_DIM),
             rng_state: 0xF0EA_1234,
         }
     }
@@ -167,51 +163,55 @@ impl FmeaEngine {
         let mut dir_a_list = Vec::with_capacity(self.config.jvp_samples);
         let mut dir_b_list = Vec::with_capacity(self.config.jvp_samples);
 
-        for k in 0..self.config.jvp_samples {
-            self.rng_state = xorshift64(self.rng_state + k as u64);
-            let seed = self.rng_state;
+        if self.config.jvp_samples > 0 {
+            for k in 0..self.config.jvp_samples {
+                self.rng_state = xorshift64(self.rng_state + k as u64);
+                let seed = self.rng_state;
 
-            // Generate random tangent for A and B
-            let tangent_a = TangentVector::random_unit(LORA_RANK * d_in, seed);
-            let tangent_b = TangentVector::random_unit(d_out * LORA_RANK, seed + 1);
+                // Generate random tangent for A and B
+                let tangent_a = TangentVector::random_unit(LORA_RANK * d_in, seed);
+                let tangent_b = TangentVector::random_unit(d_out * LORA_RANK, seed + 1);
 
-            let dir_a = Array2::from_shape_vec(
-                (LORA_RANK, d_in),
-                tangent_a.values.to_vec(),
-            )
-            .unwrap();
+                let dir_a =
+                    match Array2::from_shape_vec((LORA_RANK, d_in), tangent_a.values.to_vec()) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
 
-            let dir_b = Array2::from_shape_vec(
-                (d_out, LORA_RANK),
-                tangent_b.values.to_vec(),
-            )
-            .unwrap();
+                let dir_b =
+                    match Array2::from_shape_vec((d_out, LORA_RANK), tangent_b.values.to_vec()) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
 
-            // Forward JVP: compute how loss changes in this direction
-            // ΔW_ε = α/r · (B + ε·dir_b) · (A + ε·dir_a) · x
-            // Approximate: JVP ≈ (loss(θ+εv) - loss(θ)) / ε
-            let eps = tangent_a.epsilon;
-            let perturbed_a = &adapter.a + &(&dir_a * eps);
-            let perturbed_b = &adapter.b + &(&dir_b * eps);
+                // Forward JVP: compute how loss changes in this direction
+                // ΔW_ε = α/r · (B + ε·dir_b) · (A + ε·dir_a) · x
+                // Approximate: JVP ≈ (loss(θ+εv) - loss(θ)) / ε
+                let eps = tangent_a.epsilon;
+                let perturbed_a = &adapter.a + &(&dir_a * eps);
+                let perturbed_b = &adapter.b + &(&dir_b * eps);
 
-            let down = perturbed_a.dot(x);
-            let up = perturbed_b.dot(&down);
-            let perturbed_output = expert_output + &(&up * adapter.alpha_over_r);
-            let perturbed_loss = loss_fn(&perturbed_output, target);
+                let down = perturbed_a.dot(x);
+                let up = perturbed_b.dot(&down);
+                let perturbed_output = expert_output + &(&up * adapter.alpha_over_r);
+                let perturbed_loss = loss_fn(&perturbed_output, target);
 
-            let jvp_val = (perturbed_loss - base_loss) / eps;
-            jvp_values.push(jvp_val);
-            dir_a_list.push(dir_a);
-            dir_b_list.push(dir_b);
+                let jvp_val = (perturbed_loss - base_loss) / eps;
+                jvp_values.push(jvp_val);
+                dir_a_list.push(dir_a);
+                dir_b_list.push(dir_b);
+            }
         }
 
-        self.stats.total_jvp_evals += self.config.jvp_samples as u64;
+        self.stats.total_jvp_evals += jvp_values.len() as u64;
 
         // Multi-sample gradient estimate
         let (grad_a, grad_b) = multi_sample_lora_gradient(
             &jvp_values,
             &dir_a_list,
             &dir_b_list,
+            (LORA_RANK, d_in),
+            (d_out, LORA_RANK),
         );
 
         let gradient_norm = {
@@ -244,8 +244,34 @@ impl FmeaEngine {
             + base_loss * (1.0 - self.config.loss_ema_decay);
 
         // NES step for routing (periodic)
-        let nes_stepped = self.step % self.config.nes_update_freq == 0
-            && self.step > 0;
+        let nes_stepped = if self.config.nes_update_freq > 0
+            && (self.step + 1) % self.config.nes_update_freq == 0
+        {
+            let routing_params = self.routing_shadow.clone();
+            let active_idx = if routing_params.is_empty() {
+                None
+            } else {
+                let max_expert = routing_params.len() / MANIFOLD_DIM;
+                if max_expert == 0 {
+                    None
+                } else {
+                    Some(expert_id.min(max_expert - 1) * MANIFOLD_DIM)
+                }
+            };
+
+            let new_params = self.nes_routing_step(&routing_params, |p| {
+                let active_term = active_idx.map_or(0.0, |idx| {
+                    p.iter().skip(idx).take(MANIFOLD_DIM).copied().sum::<f32>()
+                        / MANIFOLD_DIM as f32
+                });
+                let l2_penalty = p.iter().map(|v| v * v).sum::<f32>();
+                active_term - 0.01 * l2_penalty - base_loss
+            });
+            self.routing_shadow = new_params;
+            true
+        } else {
+            false
+        };
 
         self.step += 1;
 
@@ -307,20 +333,24 @@ fn multi_sample_lora_gradient(
     jvp_values: &[f32],
     dirs_a: &[Array2<f32>],
     dirs_b: &[Array2<f32>],
+    a_shape: (usize, usize),
+    b_shape: (usize, usize),
 ) -> (Array2<f32>, Array2<f32>) {
-    let k = jvp_values.len() as f32;
-
-    let a_shape = dirs_a[0].dim();
-    let b_shape = dirs_b[0].dim();
+    let samples = jvp_values.len().min(dirs_a.len()).min(dirs_b.len());
 
     let mut grad_a = Array2::zeros(a_shape);
     let mut grad_b = Array2::zeros(b_shape);
 
-    for i in 0..jvp_values.len() {
+    if samples == 0 {
+        return (grad_a, grad_b);
+    }
+
+    for i in 0..samples {
         grad_a = &grad_a + &(&dirs_a[i] * jvp_values[i]);
         grad_b = &grad_b + &(&dirs_b[i] * jvp_values[i]);
     }
 
+    let k = samples as f32;
     grad_a /= k;
     grad_b /= k;
 
@@ -380,22 +410,58 @@ mod tests {
         let expert_output = Array1::from_vec(vec![0.5; 16]);
         let target = Array1::from_vec(vec![1.0; 16]);
 
-        let result = engine.update_step(
-            0,
-            &x,
-            &expert_output,
-            &target,
-            mse_loss,
-        );
+        let result = engine.update_step(0, &x, &expert_output, &target, mse_loss);
 
         assert!(result.loss >= 0.0);
         assert!(result.gradient_norm >= 0.0);
         assert_eq!(engine.step, 1);
         assert_eq!(engine.stats.total_lora_updates, 1);
-        assert_eq!(
-            engine.stats.total_jvp_evals,
-            4
-        );
+        assert_eq!(engine.stats.total_jvp_evals, 4);
+    }
+
+    #[test]
+    fn test_fmea_step_zero_jvp_samples_safe() {
+        let config = FmeaConfig {
+            jvp_samples: 0,
+            lora_lr: 0.001,
+            ..Default::default()
+        };
+        let mut engine = FmeaEngine::new(config, 4, 8);
+
+        let x = Array1::from_vec(vec![1.0; 8]);
+        let expert_output = Array1::from_vec(vec![0.2; 8]);
+        let target = Array1::from_vec(vec![0.7; 8]);
+
+        let result = engine.update_step(0, &x, &expert_output, &target, mse_loss);
+
+        assert!(result.gradient_norm.abs() < 1e-8);
+        assert_eq!(engine.stats.total_jvp_evals, 0);
+        assert_eq!(engine.stats.total_lora_updates, 1);
+    }
+
+    #[test]
+    fn test_nes_runs_on_schedule_in_update_step() {
+        let config = FmeaConfig {
+            jvp_samples: 1,
+            nes_update_freq: 2,
+            nes_config: NesConfig {
+                pop_size: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut engine = FmeaEngine::new(config, 4, 8);
+
+        let x = Array1::from_vec(vec![1.0; 8]);
+        let expert_output = Array1::from_vec(vec![0.0; 8]);
+        let target = Array1::from_vec(vec![1.0; 8]);
+
+        let step1 = engine.update_step(0, &x, &expert_output, &target, mse_loss);
+        let step2 = engine.update_step(0, &x, &expert_output, &target, mse_loss);
+
+        assert!(!step1.nes_stepped);
+        assert!(step2.nes_stepped);
+        assert_eq!(engine.stats.total_nes_updates, 1);
     }
 
     #[test]
@@ -433,6 +499,17 @@ mod tests {
 
         assert_eq!(new_params.len(), 10);
         assert_eq!(engine.stats.total_nes_updates, 1);
+    }
+
+    #[test]
+    fn test_multi_sample_lora_gradient_empty_inputs() {
+        let (grad_a, grad_b) =
+            multi_sample_lora_gradient(&[], &[], &[], (LORA_RANK, 8), (8, LORA_RANK));
+
+        assert_eq!(grad_a.dim(), (LORA_RANK, 8));
+        assert_eq!(grad_b.dim(), (8, LORA_RANK));
+        assert!(grad_a.iter().all(|v| v.abs() < 1e-8));
+        assert!(grad_b.iter().all(|v| v.abs() < 1e-8));
     }
 
     #[test]

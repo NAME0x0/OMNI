@@ -90,11 +90,7 @@ pub fn dispatch_matvec(
         Backend::Cpu => {
             let x_slice = x.as_slice().unwrap();
             let out = ternary_gemm_cpu::ternary_matvec_packed(
-                &mat.data,
-                mat.rows,
-                mat.cols,
-                x_slice,
-                scale,
+                &mat.data, mat.rows, mat.cols, x_slice, scale,
             );
             Array1::from_vec(out)
         }
@@ -105,13 +101,9 @@ pub fn dispatch_matvec(
             dispatch_matvec(mat, x, scale, Backend::Cpu)
         }
         #[cfg(feature = "hip")]
-        Backend::Hip => {
-            dispatch_matvec(mat, x, scale, Backend::Cpu)
-        }
+        Backend::Hip => dispatch_matvec(mat, x, scale, Backend::Cpu),
         #[cfg(feature = "sycl")]
-        Backend::Sycl => {
-            dispatch_matvec(mat, x, scale, Backend::Cpu)
-        }
+        Backend::Sycl => dispatch_matvec(mat, x, scale, Backend::Cpu),
     }
 }
 
@@ -126,11 +118,7 @@ pub fn dispatch_matvec_parallel(
         Backend::Cpu => {
             let x_slice = x.as_slice().unwrap();
             let out = ternary_gemm_cpu::ternary_matvec_parallel(
-                &mat.data,
-                mat.rows,
-                mat.cols,
-                x_slice,
-                scale,
+                &mat.data, mat.rows, mat.cols, x_slice, scale,
             );
             Array1::from_vec(out)
         }
@@ -155,23 +143,42 @@ pub fn dispatch_swiglu_ffn(
     backend: Backend,
 ) -> Array1<f32> {
     match backend {
-        Backend::Cpu => {
-            ternary_gemm_cpu::ternary_swiglu_ffn(
-                w_gate, w_up, w_down, gate_scale, up_scale, down_scale, x,
-            )
-        }
+        Backend::Cpu => ternary_gemm_cpu::ternary_swiglu_ffn(
+            w_gate, w_up, w_down, gate_scale, up_scale, down_scale, x,
+        ),
         // GPU backends fall back to CPU for now
         #[cfg(feature = "cuda")]
         Backend::Cuda => dispatch_swiglu_ffn(
-            w_gate, w_up, w_down, gate_scale, up_scale, down_scale, x, Backend::Cpu,
+            w_gate,
+            w_up,
+            w_down,
+            gate_scale,
+            up_scale,
+            down_scale,
+            x,
+            Backend::Cpu,
         ),
         #[cfg(feature = "hip")]
         Backend::Hip => dispatch_swiglu_ffn(
-            w_gate, w_up, w_down, gate_scale, up_scale, down_scale, x, Backend::Cpu,
+            w_gate,
+            w_up,
+            w_down,
+            gate_scale,
+            up_scale,
+            down_scale,
+            x,
+            Backend::Cpu,
         ),
         #[cfg(feature = "sycl")]
         Backend::Sycl => dispatch_swiglu_ffn(
-            w_gate, w_up, w_down, gate_scale, up_scale, down_scale, x, Backend::Cpu,
+            w_gate,
+            w_up,
+            w_down,
+            gate_scale,
+            up_scale,
+            down_scale,
+            x,
+            Backend::Cpu,
         ),
     }
 }
@@ -192,7 +199,7 @@ impl KernelProfile {
     pub fn cpu_default() -> Self {
         Self {
             backend: Backend::Cpu,
-            peak_gops: 50.0,       // ~50 GOPS on modern CPU with AVX512
+            peak_gops: 50.0,          // ~50 GOPS on modern CPU with AVX512
             mem_bandwidth_gbps: 40.0, // DDR5 dual-channel
             launch_overhead_us: 0.0,  // no launch overhead
         }

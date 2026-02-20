@@ -39,8 +39,14 @@ impl Codebook {
 
         // Generate role vectors
         let roles = vec![
-            "subject", "predicate", "object", "modifier",
-            "temporal", "spatial", "causal", "negation",
+            "subject",
+            "predicate",
+            "object",
+            "modifier",
+            "temporal",
+            "spatial",
+            "causal",
+            "negation",
         ];
         let role_base_seed = seed.wrapping_add(vocab_size as u64 + 1000);
         let role_vectors: HashMap<String, HyperVector> = roles
@@ -55,8 +61,7 @@ impl Codebook {
             .collect();
 
         // Position base vector
-        let position_base =
-            HyperVector::random(seed.wrapping_add(vocab_size as u64 + 2000));
+        let position_base = HyperVector::random(seed.wrapping_add(vocab_size as u64 + 2000));
 
         Self {
             token_vectors,
@@ -94,22 +99,14 @@ impl Codebook {
     }
 
     /// Encode a token at a position: bind(token_vec, position_vec).
-    pub fn encode_token_at_position(
-        &mut self,
-        token_id: usize,
-        position: usize,
-    ) -> HyperVector {
+    pub fn encode_token_at_position(&mut self, token_id: usize, position: usize) -> HyperVector {
         let tok_vec = self.token_vectors[token_id].clone();
         let pos_vec = self.position(position);
         tok_vec.xor(&pos_vec)
     }
 
     /// Encode a role-filler pair: bind(role_vec, filler_vec).
-    pub fn encode_role_filler(
-        &self,
-        role: &str,
-        filler_token_id: usize,
-    ) -> Option<HyperVector> {
+    pub fn encode_role_filler(&self, role: &str, filler_token_id: usize) -> Option<HyperVector> {
         let role_vec = self.role_vectors.get(role)?;
         let filler_vec = &self.token_vectors[filler_token_id];
         Some(role_vec.xor(filler_vec))

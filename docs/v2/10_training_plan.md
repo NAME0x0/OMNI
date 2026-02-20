@@ -263,10 +263,10 @@ embedding via metric MDS (Multi-Dimensional Scaling):
 # Compute pairwise expert distance
 D[i][j] = L1_distance(expert_i_weights, expert_j_weights)
 
-# MDS to 2D
-positions = MDS(D, n_components=2)
+# MDS to 3D
+positions = MDS(D, n_components=3)
 
-# Map to torus [0, 1)²
+# Map to torus [0, 1)^3
 positions = positions / positions.max() * 0.95 + 0.025  # margin from edges
 ```
 
@@ -283,6 +283,7 @@ manifold_training:
     - delta_loss (L1 between neighbours)
     - balance_loss (Voronoi cell variance)
     - smooth_loss (routing continuity)
+    - fold_loss (in-place manifold update regulariser; prevents append-style drift)
   hardware: 8 × A100 (experts frozen, only routing trains)
   time: ~5 days
 ```

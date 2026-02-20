@@ -1,19 +1,18 @@
 //! PDR recurrent state management.
 //!
-//! Each PDR layer maintains a state matrix `s ∈ R^{rank}` that is a compressed
-//! representation of the entire sequence history.  The state is updated via
-//! decay-and-accumulate: `s' = λ ⊙ s + v`.
+//! Each PDR layer maintains a state matrix `S_t in R^{d_model x rank}`.
+//! The state is updated as `S_t = diag(gamma_t) S_{t-1} + v_t k_t^T`.
 
-use ndarray::Array1;
+use ndarray::{Array1, Array2, Axis};
 use serde::{Deserialize, Serialize};
 
-use crate::config::PDR_RANK;
+use crate::config::{D_MODEL, PDR_RANK};
 
 /// Recurrent state for a single PDR layer.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PdrState {
-    /// State vector: s ∈ R^{rank}
-    pub state: Array1<f32>,
+    /// State matrix: `S in R^{d_model x rank}`.
+    pub state: Array2<f32>,
 
     /// Number of tokens processed through this state.
     pub tokens_seen: u64,
@@ -23,26 +22,45 @@ impl PdrState {
     /// Create a new zero-initialised state.
     pub fn new() -> Self {
         Self {
-            state: Array1::zeros(PDR_RANK),
+            state: Array2::zeros((D_MODEL, PDR_RANK)),
             tokens_seen: 0,
         }
     }
 
-    /// Decay the current state by `λ` and accumulate `v`.
+    /// Decay the current state and accumulate an outer-product update.
     ///
-    /// `s' = λ ⊙ s + v`
+    /// `S' = diag(gamma) S + v k^T`
     ///
-    /// - `lambda`: decay factors ∈ (0, 1)^rank
-    /// - `v`: new value to accumulate ∈ R^rank
-    pub fn decay_and_accumulate(&mut self, lambda: &Array1<f32>, v: &Array1<f32>) {
-        self.state = &self.state * lambda + v;
-        self.tokens_seen += 1;
+    /// If any vector has an unexpected shape, this is a no-op.
+    pub fn decay_and_accumulate(&mut self, gamma: &Array1<f32>, v: &Array1<f32>, k: &Array1<f32>) {
+        if gamma.len() != D_MODEL || v.len() != D_MODEL || k.len() != PDR_RANK {
+            return;
+        }
+
+        let gamma_col = gamma.view().insert_axis(Axis(1));
+        let v_col = v.view().insert_axis(Axis(1));
+        let k_row = k.view().insert_axis(Axis(0));
+        let update = v_col.dot(&k_row);
+
+        self.state = &self.state * &gamma_col + &update;
+        self.tokens_seen = self.tokens_seen.saturating_add(1);
     }
 
-    /// Get the mean state (for projection).  For now, returns the state
-    /// directly.  In a multi-head variant, this would average across heads.
+    /// Read out state with a query vector.
+    ///
+    /// `o_hat = S q`
+    pub fn readout(&self, q: &Array1<f32>) -> Array1<f32> {
+        if q.len() != PDR_RANK {
+            return Array1::zeros(D_MODEL);
+        }
+        self.state.dot(q)
+    }
+
+    /// Mean over rank dimension for diagnostics.
     pub fn mean_state(&self) -> Array1<f32> {
-        self.state.clone()
+        self.state
+            .mean_axis(Axis(1))
+            .unwrap_or_else(|| Array1::zeros(D_MODEL))
     }
 
     /// Reset state to zeros.
@@ -56,14 +74,14 @@ impl PdrState {
         self.state.iter().all(|v| v.is_finite())
     }
 
-    /// L2 norm of the state (for monitoring divergence).
+    /// Frobenius norm of the state (for monitoring divergence).
     pub fn norm(&self) -> f32 {
         self.state.mapv(|v| v * v).sum().sqrt()
     }
 
     /// Serialise state to bytes (for persistence across sessions).
-    pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("PdrState serialisation should not fail")
+    pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(bincode::serialize(self)?)
     }
 
     /// Deserialise state from bytes.
@@ -73,7 +91,7 @@ impl PdrState {
 
     /// Memory footprint in bytes.
     pub fn size_bytes(&self) -> usize {
-        PDR_RANK * std::mem::size_of::<f32>() + std::mem::size_of::<u64>()
+        D_MODEL * PDR_RANK * std::mem::size_of::<f32>() + std::mem::size_of::<u64>()
     }
 }
 
@@ -115,8 +133,8 @@ impl PdrStateBank {
     }
 
     /// Serialise all states.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("PdrStateBank serialisation should not fail")
+    pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(bincode::serialize(self)?)
     }
 
     /// Deserialise all states.
@@ -132,7 +150,7 @@ mod tests {
     #[test]
     fn test_state_init() {
         let state = PdrState::new();
-        assert_eq!(state.state.len(), PDR_RANK);
+        assert_eq!(state.state.shape(), &[D_MODEL, PDR_RANK]);
         assert_eq!(state.tokens_seen, 0);
         assert!(state.is_healthy());
     }
@@ -140,31 +158,41 @@ mod tests {
     #[test]
     fn test_decay_and_accumulate() {
         let mut state = PdrState::new();
-        let lambda = Array1::from_vec(vec![0.9; PDR_RANK]);
-        let v = Array1::from_vec(vec![1.0; PDR_RANK]);
+        let gamma = Array1::from_vec(vec![0.9; D_MODEL]);
+        let v = Array1::from_vec(vec![1.0; D_MODEL]);
+        let k = Array1::from_vec(vec![1.0; PDR_RANK]);
 
-        state.decay_and_accumulate(&lambda, &v);
+        state.decay_and_accumulate(&gamma, &v, &k);
         assert_eq!(state.tokens_seen, 1);
-        // s = 0.9 * 0 + 1.0 = 1.0
-        assert!((state.state[0] - 1.0).abs() < 1e-6);
+        // S = diag(gamma) * 0 + v k^T = 1
+        assert!((state.state[[0, 0]] - 1.0).abs() < 1e-6);
 
-        state.decay_and_accumulate(&lambda, &v);
+        state.decay_and_accumulate(&gamma, &v, &k);
         assert_eq!(state.tokens_seen, 2);
-        // s = 0.9 * 1.0 + 1.0 = 1.9
-        assert!((state.state[0] - 1.9).abs() < 1e-6);
+        // S = 0.9 * 1.0 + 1.0 = 1.9
+        assert!((state.state[[0, 0]] - 1.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_readout_shape() {
+        let state = PdrState::new();
+        let q = Array1::ones(PDR_RANK);
+        let out = state.readout(&q);
+        assert_eq!(out.len(), D_MODEL);
     }
 
     #[test]
     fn test_serialisation_roundtrip() {
         let mut state = PdrState::new();
-        let lambda = Array1::from_vec(vec![0.5; PDR_RANK]);
-        let v = Array1::from_vec(vec![0.3; PDR_RANK]);
-        state.decay_and_accumulate(&lambda, &v);
+        let gamma = Array1::from_vec(vec![0.5; D_MODEL]);
+        let v = Array1::from_vec(vec![0.3; D_MODEL]);
+        let k = Array1::from_vec(vec![0.4; PDR_RANK]);
+        state.decay_and_accumulate(&gamma, &v, &k);
 
-        let bytes = state.to_bytes();
+        let bytes = state.to_bytes().unwrap();
         let restored = PdrState::from_bytes(&bytes).unwrap();
         assert_eq!(state.tokens_seen, restored.tokens_seen);
-        assert!((state.state[0] - restored.state[0]).abs() < 1e-8);
+        assert!((state.state[[0, 0]] - restored.state[[0, 0]]).abs() < 1e-8);
     }
 
     #[test]
@@ -179,10 +207,11 @@ mod tests {
         let mut state = PdrState::new();
         assert!((state.norm() - 0.0).abs() < 1e-8);
 
-        let lambda = Array1::ones(PDR_RANK);
-        let v = Array1::ones(PDR_RANK);
-        state.decay_and_accumulate(&lambda, &v);
-        let expected_norm = (PDR_RANK as f32).sqrt();
+        let gamma = Array1::ones(D_MODEL);
+        let v = Array1::ones(D_MODEL);
+        let k = Array1::ones(PDR_RANK);
+        state.decay_and_accumulate(&gamma, &v, &k);
+        let expected_norm = ((D_MODEL * PDR_RANK) as f32).sqrt();
         assert!((state.norm() - expected_norm).abs() < 1e-4);
     }
 }

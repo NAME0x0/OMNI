@@ -6,6 +6,7 @@
 //! - Health monitoring and diagnostics
 //! - CLI binary entry point
 
-pub mod provider;
-pub mod pipeline;
 pub mod health;
+pub mod pipeline;
+pub mod provider;
+pub mod zeroclaw;

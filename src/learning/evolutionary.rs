@@ -108,10 +108,7 @@ impl NesOptimizer {
     ///
     /// Using antithetic sampling: each perturbation ε_i has fitness f(θ+σε_i)
     /// Gradient estimate: (1 / (K·σ)) · Σ f_i · ε_i
-    pub fn compute_gradient(
-        &mut self,
-        samples: &[NesSample],
-    ) -> Array1<f32> {
+    pub fn compute_gradient(&mut self, samples: &[NesSample]) -> Array1<f32> {
         let k = samples.len();
         if k == 0 {
             return Array1::zeros(0);
@@ -124,8 +121,7 @@ impl NesOptimizer {
             fitness_shaping(samples)
         } else {
             // Normalise fitnesses
-            let mean: f32 =
-                samples.iter().map(|s| s.fitness).sum::<f32>() / k as f32;
+            let mean: f32 = samples.iter().map(|s| s.fitness).sum::<f32>() / k as f32;
             let std: f32 = (samples
                 .iter()
                 .map(|s| (s.fitness - mean).powi(2))
@@ -134,10 +130,7 @@ impl NesOptimizer {
                 .sqrt()
                 .max(1e-8);
 
-            samples
-                .iter()
-                .map(|s| (s.fitness - mean) / std)
-                .collect()
+            samples.iter().map(|s| (s.fitness - mean) / std).collect()
         };
 
         // Gradient estimate
@@ -160,11 +153,7 @@ impl NesOptimizer {
     }
 
     /// Apply the gradient to parameter vector.
-    pub fn step(
-        &self,
-        params: &Array1<f32>,
-        gradient: &Array1<f32>,
-    ) -> Array1<f32> {
+    pub fn step(&self, params: &Array1<f32>, gradient: &Array1<f32>) -> Array1<f32> {
         params + &(gradient * self.config.lr)
     }
 }
@@ -196,7 +185,10 @@ fn fitness_shaping(samples: &[NesSample]) -> Vec<f32> {
     // Normalise
     let sum: f32 = raw_utilities.iter().sum();
     if sum > 0.0 {
-        raw_utilities.iter().map(|&u| u / sum - 1.0 / k as f32).collect()
+        raw_utilities
+            .iter()
+            .map(|&u| u / sum - 1.0 / k as f32)
+            .collect()
     } else {
         vec![0.0; k]
     }

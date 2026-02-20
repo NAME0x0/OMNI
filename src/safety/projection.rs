@@ -197,8 +197,7 @@ pub fn project_onto_polytope(
         if let Some((_, anchor_dist)) = polytope.anchors.nearest(&result.point) {
             // If far from nearest anchor, pull toward hull
             let blend_factor = (anchor_dist / 10.0).min(1.0) * 0.5;
-            result.point =
-                &result.point * (1.0 - blend_factor) + &hull_proj * blend_factor;
+            result.point = &result.point * (1.0 - blend_factor) + &hull_proj * blend_factor;
         }
     }
 
@@ -207,11 +206,7 @@ pub fn project_onto_polytope(
 
 /// Simple (non-Dykstra) cyclic projection for comparison.
 /// Less accurate but faster — good for rough enforcement.
-pub fn cyclic_project(
-    x: &Array1<f32>,
-    halfspaces: &HalfspaceSet,
-    max_iters: usize,
-) -> Array1<f32> {
+pub fn cyclic_project(x: &Array1<f32>, halfspaces: &HalfspaceSet, max_iters: usize) -> Array1<f32> {
     let mut y = x.clone();
     for _ in 0..max_iters {
         for h in &halfspaces.constraints {
@@ -229,8 +224,8 @@ pub fn project_box(x: &Array1<f32>, lo: f32, hi: f32) -> Array1<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::halfspace::Halfspace;
+    use super::*;
 
     fn make_box_constraints(dim: usize, bound: f32) -> HalfspaceSet {
         let mut set = HalfspaceSet::new();
@@ -272,8 +267,16 @@ mod tests {
         let result = dykstra_project(&x, &constraints, &config);
 
         assert!(result.converged);
-        assert!((result.point[0] - 1.0).abs() < 1e-3, "x0 = {}", result.point[0]);
-        assert!((result.point[1] + 1.0).abs() < 1e-3, "x1 = {}", result.point[1]);
+        assert!(
+            (result.point[0] - 1.0).abs() < 1e-3,
+            "x0 = {}",
+            result.point[0]
+        );
+        assert!(
+            (result.point[1] + 1.0).abs() < 1e-3,
+            "x1 = {}",
+            result.point[1]
+        );
     }
 
     #[test]
@@ -317,8 +320,11 @@ mod tests {
         let x = Array1::from_vec(vec![10.0, 10.0]);
         let result = dykstra_project(&x, &set, &config);
 
-        assert!(result.converged, "did not converge after {} iters (residual={})",
-            result.iterations, result.residual);
+        assert!(
+            result.converged,
+            "did not converge after {} iters (residual={})",
+            result.iterations, result.residual
+        );
         // Should be inside all constraints
         assert!(set.is_feasible(&result.point));
     }

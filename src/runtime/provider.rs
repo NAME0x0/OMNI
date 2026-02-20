@@ -111,6 +111,9 @@ pub struct WeightProvider {
     /// Access counter for LRU.
     access_counter: u64,
 
+    /// Temporary slot for uncached loads when cache limits disallow insertion.
+    uncached: Option<ExpertWeights>,
+
     /// Stats.
     pub stats: ProviderStats,
 }
@@ -145,14 +148,14 @@ impl WeightProvider {
             cache: HashMap::new(),
             cache_bytes: 0,
             access_counter: 0,
+            uncached: None,
             stats: ProviderStats::default(),
         }
     }
 
     /// Register a shard in the index.
     pub fn register_shard(&mut self, info: ShardInfo) {
-        self.shard_index
-            .insert((info.layer, info.expert_id), info);
+        self.shard_index.insert((info.layer, info.expert_id), info);
     }
 
     /// Scan model directory and build shard index.
@@ -164,14 +167,14 @@ impl WeightProvider {
 
         let mut count = 0;
         // Expected naming: expert_{expert_id}_layer_{layer}.bin
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if let Some(info) = parse_shard_filename(name, &path) {
-                        self.register_shard(info);
-                        count += 1;
-                    }
+        let entries = std::fs::read_dir(dir)?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(info) = parse_shard_filename(name, &path) {
+                    self.register_shard(info);
+                    count += 1;
                 }
             }
         }
@@ -180,18 +183,29 @@ impl WeightProvider {
     }
 
     /// Get expert weights (from cache or disk).
-    pub fn get_expert(
-        &mut self,
-        layer: usize,
-        expert_id: usize,
-    ) -> anyhow::Result<&ExpertWeights> {
+    pub fn get_expert(&mut self, layer: usize, expert_id: usize) -> anyhow::Result<&ExpertWeights> {
         self.access_counter += 1;
         let key = (layer, expert_id);
 
         if self.cache.contains_key(&key) {
             self.stats.cache_hits += 1;
-            self.cache.get_mut(&key).unwrap().last_access = self.access_counter;
-            return Ok(&self.cache[&key].weights);
+            if let Some(entry) = self.cache.get_mut(&key) {
+                entry.last_access = self.access_counter;
+            } else {
+                return Err(anyhow::anyhow!(
+                    "cache entry ({}, {}) disappeared during update",
+                    layer,
+                    expert_id
+                ));
+            }
+            if let Some(entry) = self.cache.get(&key) {
+                return Ok(&entry.weights);
+            }
+            return Err(anyhow::anyhow!(
+                "cache entry ({}, {}) disappeared after update",
+                layer,
+                expert_id
+            ));
         }
 
         self.stats.cache_misses += 1;
@@ -200,8 +214,29 @@ impl WeightProvider {
         let weights = self.load_from_disk(layer, expert_id)?;
         let size = weights.size_bytes() as u64;
 
+        // If caching is disabled (by count or bytes), keep only the most recent load.
+        if self.config.max_cached_experts == 0 || self.config.max_cache_bytes == 0 {
+            self.uncached = Some(weights);
+            if let Some(uncached) = self.uncached.as_ref() {
+                return Ok(uncached);
+            }
+            return Err(anyhow::anyhow!("failed to retain uncached expert payload"));
+        }
+
+        // If a single expert exceeds byte capacity, do not force it into cache.
+        if size > self.config.max_cache_bytes {
+            self.uncached = Some(weights);
+            if let Some(uncached) = self.uncached.as_ref() {
+                return Ok(uncached);
+            }
+            return Err(anyhow::anyhow!(
+                "failed to retain oversized uncached expert payload"
+            ));
+        }
+
         // Evict if necessary
-        while self.cache_bytes + size > self.config.max_cache_bytes
+        while (self.cache_bytes + size > self.config.max_cache_bytes
+            || self.cache.len() >= self.config.max_cached_experts)
             && !self.cache.is_empty()
         {
             self.evict_lru();
@@ -221,11 +256,7 @@ impl WeightProvider {
     }
 
     /// Load expert weights from disk.
-    fn load_from_disk(
-        &mut self,
-        layer: usize,
-        expert_id: usize,
-    ) -> anyhow::Result<ExpertWeights> {
+    fn load_from_disk(&mut self, layer: usize, expert_id: usize) -> anyhow::Result<ExpertWeights> {
         let key = (layer, expert_id);
 
         if let Some(shard) = self.shard_index.get(&key) {
@@ -252,11 +283,7 @@ impl WeightProvider {
 
     /// Evict the least-recently-used cache entry.
     fn evict_lru(&mut self) {
-        if let Some((&key, _)) = self
-            .cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_access)
-        {
+        if let Some((&key, _)) = self.cache.iter().min_by_key(|(_, entry)| entry.last_access) {
             if let Some(entry) = self.cache.remove(&key) {
                 self.cache_bytes -= entry.weights.size_bytes() as u64;
                 self.stats.evictions += 1;
@@ -276,19 +303,31 @@ impl WeightProvider {
 
     /// Current cache utilisation (bytes used / max bytes).
     pub fn cache_utilisation(&self) -> f32 {
+        if self.config.max_cache_bytes == 0 {
+            return 0.0;
+        }
         self.cache_bytes as f32 / self.config.max_cache_bytes as f32
     }
 
     /// Prefetch: preload experts for upcoming layers.
-    pub fn prefetch(
-        &mut self,
-        layer: usize,
-        expert_ids: &[usize],
-    ) -> anyhow::Result<usize> {
+    pub fn prefetch(&mut self, layer: usize, expert_ids: &[usize]) -> anyhow::Result<usize> {
+        if self.config.prefetch_depth == 0 || expert_ids.is_empty() {
+            return Ok(0);
+        }
+
         let mut loaded = 0;
-        for &eid in expert_ids {
-            if !self.is_cached(layer, eid) {
-                let _ = self.get_expert(layer, eid)?;
+        for depth in 0..self.config.prefetch_depth {
+            let Some(target_layer) = layer.checked_add(depth) else {
+                break;
+            };
+
+            for &eid in expert_ids {
+                let key = (target_layer, eid);
+                if !self.shard_index.contains_key(&key) || self.is_cached(target_layer, eid) {
+                    continue;
+                }
+
+                let _ = self.get_expert(target_layer, eid)?;
                 loaded += 1;
             }
         }
@@ -306,10 +345,7 @@ fn parse_shard_filename(name: &str, path: &Path) -> Option<ShardInfo> {
         name
     };
 
-    let parts: Vec<&str> = clean
-        .trim_end_matches(".bin")
-        .split('_')
-        .collect();
+    let parts: Vec<&str> = clean.trim_end_matches(".bin").split('_').collect();
 
     if parts.len() >= 4 && parts[0] == "expert" && parts[2] == "layer" {
         let expert_id = parts[1].parse::<usize>().ok()?;
@@ -332,6 +368,14 @@ fn parse_shard_filename(name: &str, path: &Path) -> Option<ShardInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    fn write_shard_file(dir: &Path, expert_id: usize, layer: usize, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(format!("expert_{expert_id}_layer_{layer}.bin"));
+        std::fs::write(&path, bytes).expect("failed to write shard file");
+        path
+    }
 
     #[test]
     fn test_provider_creation() {
@@ -384,5 +428,75 @@ mod tests {
             is_delta: false,
         };
         assert!((w.size_mb() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_scan_model_dir_propagates_read_dir_errors() {
+        let dir = tempdir().expect("failed to create tempdir");
+        let file_path = dir.path().join("not_a_directory.bin");
+        std::fs::write(&file_path, b"data").expect("failed to create temp file");
+
+        let config = ProviderConfig {
+            model_dir: file_path,
+            ..Default::default()
+        };
+        let mut provider = WeightProvider::new(config);
+        let result = provider.scan_model_dir();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cache_respects_max_cached_experts() {
+        let dir = tempdir().expect("failed to create tempdir");
+        write_shard_file(dir.path(), 0, 0, &[1, 2, 3, 4]);
+        write_shard_file(dir.path(), 1, 0, &[5, 6, 7, 8]);
+
+        let config = ProviderConfig {
+            model_dir: dir.path().to_path_buf(),
+            max_cached_experts: 1,
+            max_cache_bytes: 1024,
+            ..Default::default()
+        };
+        let mut provider = WeightProvider::new(config);
+        provider
+            .scan_model_dir()
+            .expect("scan_model_dir should succeed");
+
+        provider
+            .get_expert(0, 0)
+            .expect("first expert load should succeed");
+        assert_eq!(provider.cached_count(), 1);
+
+        provider
+            .get_expert(0, 1)
+            .expect("second expert load should succeed");
+        assert_eq!(provider.cached_count(), 1);
+        assert!(provider.stats.evictions >= 1);
+    }
+
+    #[test]
+    fn test_prefetch_respects_depth() {
+        let dir = tempdir().expect("failed to create tempdir");
+        write_shard_file(dir.path(), 3, 0, &[1]);
+        write_shard_file(dir.path(), 3, 1, &[1]);
+        write_shard_file(dir.path(), 3, 2, &[1]);
+
+        let config = ProviderConfig {
+            model_dir: dir.path().to_path_buf(),
+            prefetch_depth: 2,
+            max_cached_experts: 8,
+            max_cache_bytes: 1024,
+            ..Default::default()
+        };
+        let mut provider = WeightProvider::new(config);
+        provider
+            .scan_model_dir()
+            .expect("scan_model_dir should succeed");
+
+        let loaded = provider.prefetch(0, &[3]).expect("prefetch should succeed");
+        assert_eq!(loaded, 2);
+        assert!(provider.is_cached(0, 3));
+        assert!(provider.is_cached(1, 3));
+        assert!(!provider.is_cached(2, 3));
     }
 }

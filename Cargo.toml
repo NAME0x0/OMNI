@@ -60,12 +60,16 @@ proptest = "1"
 approx = "0.5"
 tempfile = "3"
 
+[build-dependencies]
+cc = "1"
+
 [features]
 default = ["cpu"]
 cpu = []
 cuda = []
 hip = []
 sycl = []
+native-manifold = []
 
 [profile.release]
 opt-level = 3

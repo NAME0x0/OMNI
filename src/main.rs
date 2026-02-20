@@ -6,8 +6,10 @@
 //! This is the CLI binary entry point.
 
 use clap::Parser;
-use perspective::runtime::pipeline::{InferencePipeline, PipelineConfig};
 use perspective::runtime::health::HealthMonitor;
+use perspective::runtime::pipeline::{InferencePipeline, PipelineConfig};
+use perspective::runtime::zeroclaw::{ZeroclawClient, ZeroclawConfig};
+use std::path::PathBuf;
 
 /// PERSPECTIVE inference CLI.
 #[derive(Parser, Debug)]
@@ -48,6 +50,18 @@ struct Cli {
     /// Input prompt.
     #[arg(trailing_var_arg = true)]
     prompt: Vec<String>,
+
+    /// Optional ZeroClaw task to execute via swarm orchestration.
+    #[arg(long)]
+    swarm_task: Option<String>,
+
+    /// ZeroClaw executable name/path.
+    #[arg(long, default_value = "zeroclaw")]
+    zeroclaw_bin: String,
+
+    /// Working directory for ZeroClaw execution.
+    #[arg(long, default_value = ".")]
+    swarm_workspace: String,
 }
 
 fn main() {
@@ -58,6 +72,34 @@ fn main() {
 
     tracing::info!("PERSPECTIVE v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Model directory: {}", cli.model_dir);
+
+    if let Some(task) = cli.swarm_task.as_deref() {
+        let config = ZeroclawConfig {
+            executable: PathBuf::from(&cli.zeroclaw_bin),
+            workspace: PathBuf::from(&cli.swarm_workspace),
+            ..Default::default()
+        };
+        let client = ZeroclawClient::new(config);
+        if let Err(err) = client.check_available() {
+            tracing::error!("ZeroClaw unavailable: {}", err);
+            return;
+        }
+        match client.run_task(task) {
+            Ok(result) => {
+                tracing::info!("ZeroClaw run exit code: {}", result.status_code);
+                if !result.stdout.trim().is_empty() {
+                    tracing::info!("ZeroClaw output:\n{}", result.stdout.trim());
+                }
+                if !result.stderr.trim().is_empty() {
+                    tracing::warn!("ZeroClaw stderr:\n{}", result.stderr.trim());
+                }
+            }
+            Err(err) => {
+                tracing::error!("ZeroClaw task failed: {}", err);
+            }
+        }
+        return;
+    }
 
     let config = PipelineConfig {
         enable_fmea: cli.learn,
@@ -95,7 +137,13 @@ fn main() {
 
     // Placeholder: simulate generation
     let prompt_tokens: Vec<usize> = (0..prompt_text.len().min(100)).collect();
-    let result = pipeline.generate(&prompt_tokens, cli.max_tokens, 0);
+    let result = match pipeline.generate(&prompt_tokens, cli.max_tokens, 0) {
+        Ok(result) => result,
+        Err(err) => {
+            tracing::error!("Generation failed: {}", err);
+            return;
+        }
+    };
 
     tracing::info!(
         "Generated {} tokens in {:.1} ms ({:.1} tok/s)",

@@ -6,6 +6,7 @@
 //!
 //! Delta streaming is the key to achieving acceptable throughput on PCIe 3.0.
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -92,10 +93,7 @@ impl DeltaStats {
 #[derive(Clone, Debug)]
 pub enum LoadStrategy {
     /// Load the full expert from NVMe.
-    Full {
-        expert_id: usize,
-        size_bytes: u64,
-    },
+    Full { expert_id: usize, size_bytes: u64 },
 
     /// Load a delta from the currently buffered expert.
     Delta {
@@ -105,9 +103,7 @@ pub enum LoadStrategy {
     },
 
     /// Expert is already in the buffer — no load needed.
-    Cached {
-        expert_id: usize,
-    },
+    Cached { expert_id: usize },
 }
 
 impl DeltaStreamManager {
@@ -136,7 +132,7 @@ impl DeltaStreamManager {
         &self,
         target: usize,
         buffered: Option<usize>,
-        _manifold: &ExpertManifold,
+        manifold: &ExpertManifold,
     ) -> LoadStrategy {
         // Already buffered?
         if buffered == Some(target) {
@@ -145,8 +141,11 @@ impl DeltaStreamManager {
 
         // Do we have a delta from the buffered expert?
         if let Some(source) = buffered {
+            let are_neighbours =
+                manifold.are_neighbours(source, target) || manifold.are_neighbours(target, source);
+
             if let Some(delta_info) = self.deltas.get(&(source, target)) {
-                if delta_info.diff_ratio < self.delta_threshold {
+                if are_neighbours || delta_info.diff_ratio < self.delta_threshold {
                     return LoadStrategy::Delta {
                         source,
                         target,
@@ -157,7 +156,7 @@ impl DeltaStreamManager {
 
             // Check reverse delta (if A→B exists, we can reverse it)
             if let Some(delta_info) = self.deltas.get(&(target, source)) {
-                if delta_info.diff_ratio < self.delta_threshold {
+                if are_neighbours || delta_info.diff_ratio < self.delta_threshold {
                     // Create a reversed version
                     let reversed = DeltaFileInfo {
                         source,
@@ -219,18 +218,19 @@ impl DeltaStreamManager {
     /// Scan a directory for delta files and register them.
     pub fn scan_delta_directory(&mut self, dir: &Path) -> anyhow::Result<usize> {
         let mut count = 0;
-        if dir.is_dir() {
-            for entry in std::fs::read_dir(dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("delta_") && name.ends_with(".trd") {
-                        // Parse filename: delta_SSS_TTT.trd
-                        if let Some(info) = parse_delta_filename(name, &path) {
-                            self.register_delta(info);
-                            count += 1;
-                        }
-                    }
+        let entries = std::fs::read_dir(dir)
+            .with_context(|| format!("failed to read delta directory '{}'", dir.display()))?;
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("failed to read an entry in '{}'", dir.display()))?;
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                // Parse filename: delta_SSS_TTT.trd
+                if let Some(info) = parse_delta_filename(name, &path).with_context(|| {
+                    format!("failed to parse delta metadata for '{}'", path.display())
+                })? {
+                    self.register_delta(info);
+                    count += 1;
                 }
             }
         }
@@ -239,33 +239,51 @@ impl DeltaStreamManager {
 }
 
 /// Parse a delta filename like "delta_042_043.trd" into a DeltaFileInfo.
-fn parse_delta_filename(name: &str, path: &Path) -> Option<DeltaFileInfo> {
-    let stripped = name.strip_prefix("delta_")?.strip_suffix(".trd")?;
-    let parts: Vec<&str> = stripped.split('_').collect();
-    if parts.len() != 2 {
-        return None;
+fn parse_delta_filename(name: &str, path: &Path) -> anyhow::Result<Option<DeltaFileInfo>> {
+    let Some(stripped) = name
+        .strip_prefix("delta_")
+        .and_then(|n| n.strip_suffix(".trd"))
+    else {
+        return Ok(None);
+    };
+    let Some((source_s, target_s)) = stripped.split_once('_') else {
+        return Ok(None);
+    };
+    if source_s.is_empty() || target_s.is_empty() || target_s.contains('_') {
+        return Ok(None);
     }
-    let source: usize = parts[0].parse().ok()?;
-    let target: usize = parts[1].parse().ok()?;
+
+    let source: usize = match source_s.parse() {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let target: usize = match target_s.parse() {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
     if source >= N_EXPERTS || target >= N_EXPERTS {
-        return None;
+        return Ok(None);
     }
 
-    let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let size_bytes = std::fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for '{}'", path.display()))?
+        .len();
 
-    Some(DeltaFileInfo {
+    Ok(Some(DeltaFileInfo {
         source,
         target,
         path: path.to_path_buf(),
         size_bytes,
-        diff_count: 0,    // Unknown until loaded
-        diff_ratio: 0.1,  // Default estimate: 10% diff for neighbours
-    })
+        diff_count: 0,   // Unknown until loaded
+        diff_ratio: 0.1, // Default estimate: 10% diff for neighbours
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_cached_strategy() {
@@ -323,16 +341,112 @@ mod tests {
 
     #[test]
     fn test_parse_delta_filename() {
-        let info = parse_delta_filename("delta_042_043.trd", Path::new("delta_042_043.trd"));
-        assert!(info.is_some());
-        let info = info.unwrap();
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("delta_042_043.trd");
+        fs::write(&path, [1_u8, 2, 3, 4]).unwrap();
+
+        let info = parse_delta_filename("delta_042_043.trd", &path)
+            .unwrap()
+            .unwrap();
         assert_eq!(info.source, 42);
         assert_eq!(info.target, 43);
+        assert_eq!(info.size_bytes, 4);
     }
 
     #[test]
     fn test_parse_invalid_filename() {
-        assert!(parse_delta_filename("expert_042.trit", Path::new("x")).is_none());
-        assert!(parse_delta_filename("delta_999_001.trd", Path::new("x")).is_none());
+        assert!(parse_delta_filename("expert_042.trit", Path::new("x"))
+            .unwrap()
+            .is_none());
+        assert!(parse_delta_filename("delta_999_001.trd", Path::new("x"))
+            .unwrap()
+            .is_none());
+        assert!(
+            parse_delta_filename("delta_001_002_003.trd", Path::new("x"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_parse_delta_filename_propagates_metadata_errors() {
+        let err = parse_delta_filename("delta_001_002.trd", Path::new("missing_delta.trd"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to read metadata"));
+    }
+
+    #[test]
+    fn test_scan_delta_directory_propagates_read_dir_errors() {
+        let mut mgr = DeltaStreamManager::new();
+        let tmp = tempdir().unwrap();
+        let missing_dir = tmp.path().join("missing");
+        let err = mgr
+            .scan_delta_directory(&missing_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to read delta directory"));
+    }
+
+    #[test]
+    fn test_scan_delta_directory_registers_valid_delta_files() {
+        let mut mgr = DeltaStreamManager::new();
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("delta_000_001.trd"), [9_u8, 9]).unwrap();
+        fs::write(tmp.path().join("not_delta.txt"), [1_u8]).unwrap();
+
+        let count = mgr.scan_delta_directory(tmp.path()).unwrap();
+        assert_eq!(count, 1);
+        assert!(mgr.deltas.contains_key(&(0, 1)));
+    }
+
+    #[test]
+    fn test_decide_prefers_delta_for_neighbours() {
+        let mut mgr = DeltaStreamManager::new();
+        mgr.delta_threshold = 0.01;
+        mgr.register_expert_size(1, 27_000_000);
+        mgr.register_delta(DeltaFileInfo {
+            source: 0,
+            target: 1,
+            path: PathBuf::from("delta_000_001.trd"),
+            size_bytes: 10_000_000,
+            diff_count: 50_000_000,
+            diff_ratio: 0.9,
+        });
+
+        let manifold = ExpertManifold::default_grid();
+        assert!(manifold.are_neighbours(0, 1) || manifold.are_neighbours(1, 0));
+
+        let strategy = mgr.decide(1, Some(0), &manifold);
+        assert!(matches!(
+            strategy,
+            LoadStrategy::Delta {
+                source: 0,
+                target: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_decide_falls_back_to_full_for_non_neighbour_high_diff() {
+        let mut mgr = DeltaStreamManager::new();
+        mgr.delta_threshold = 0.01;
+        mgr.register_expert_size(68, 27_000_000);
+        mgr.register_delta(DeltaFileInfo {
+            source: 0,
+            target: 68,
+            path: PathBuf::from("delta_000_068.trd"),
+            size_bytes: 20_000_000,
+            diff_count: 60_000_000,
+            diff_ratio: 0.9,
+        });
+
+        let manifold = ExpertManifold::default_grid();
+        assert!(!manifold.are_neighbours(0, 68));
+        assert!(!manifold.are_neighbours(68, 0));
+
+        let strategy = mgr.decide(68, Some(0), &manifold);
+        assert!(matches!(strategy, LoadStrategy::Full { expert_id: 68, .. }));
     }
 }

@@ -6,12 +6,9 @@
 use ndarray::Array1;
 
 use crate::decoding::agreement::{
-    compute_agreement, should_accept, AcceptancePolicy, AgreementResult,
-    RejectionStrategy,
+    compute_agreement, should_accept, AcceptancePolicy, AgreementResult, RejectionStrategy,
 };
-use crate::decoding::perspective_config::{
-    apply_perspective, PerspectiveConfig,
-};
+use crate::decoding::perspective_config::{apply_perspective, PerspectiveConfig};
 
 /// A single MPD decoding step result.
 #[derive(Clone, Debug)]
@@ -123,11 +120,7 @@ impl MpdDecoder {
     /// `logits_fn` is called for each perspective with modified parameters,
     /// returning the logits for that perspective. In practice, this would
     /// re-run the forward pass with perturbations or apply them post-hoc.
-    pub fn decode_step(
-        &mut self,
-        base_logits: &Array1<f32>,
-        step_seed: u64,
-    ) -> MpdStepResult {
+    pub fn decode_step(&mut self, base_logits: &Array1<f32>, step_seed: u64) -> MpdStepResult {
         self.stats.total_steps += 1;
 
         // Apply each perspective's perturbation to the base logits
@@ -183,9 +176,7 @@ impl MpdDecoder {
                 .map(|(i, config)| {
                     let mut modified = config.clone();
                     // Lower temperature on resamples
-                    if let RejectionStrategy::Resample { temperature } =
-                        self.rejection_strategy
-                    {
+                    if let RejectionStrategy::Resample { temperature } = self.rejection_strategy {
                         modified.temperature *= temperature;
                     }
                     apply_perspective(base_logits, &modified, resample_seed + i as u64)
@@ -227,10 +218,7 @@ impl MpdDecoder {
     }
 
     /// Decode a full sequence of `max_tokens` tokens.
-    pub fn decode_sequence(
-        &mut self,
-        logits_stream: &[Array1<f32>],
-    ) -> Vec<MpdStepResult> {
+    pub fn decode_sequence(&mut self, logits_stream: &[Array1<f32>]) -> Vec<MpdStepResult> {
         logits_stream
             .iter()
             .enumerate()
@@ -289,9 +277,7 @@ mod tests {
     #[test]
     fn test_mpd_sequence_decode() {
         let mut decoder = MpdDecoder::new();
-        let stream: Vec<Array1<f32>> = (0..5)
-            .map(|i| sharp_logits(i, 20))
-            .collect();
+        let stream: Vec<Array1<f32>> = (0..5).map(|i| sharp_logits(i, 20)).collect();
         let results = decoder.decode_sequence(&stream);
         assert_eq!(results.len(), 5);
     }

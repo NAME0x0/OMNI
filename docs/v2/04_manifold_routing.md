@@ -25,7 +25,7 @@ Problems with flat routing:
 
 ### The Perspective Approach
 
-Embed all 128 experts as points on a **2-D flat torus** $\mathbb{T}^2$.
+Embed all 128 experts as points on a **3-D flat torus** $\mathbb{T}^3$.
 The router maps the hidden state to a point on this surface, and the
 nearest expert is activated.
 
@@ -35,8 +35,8 @@ Benefits:
   discrete selection jumps
 - **Natural load balancing →** uniform expert placement on the torus gives
   each expert an equal Voronoi cell
-- **Visualisable →** the 2-D torus can be unrolled into a rectangle for
-  direct plotting of routing patterns
+- **Foldable updates →** new routing evidence is folded into existing expert
+  coordinates rather than appended as new manifold entries
 
 ---
 
@@ -44,35 +44,37 @@ Benefits:
 
 ### 2.1  Definitions
 
-The flat torus $\mathbb{T}^2 = [0, 1)^2$ with periodic boundaries.
-A point $z = (z_1, z_2)$ wraps: $z_1 + 1 \equiv z_1$, $z_2 + 1 \equiv z_2$.
+The flat torus $\mathbb{T}^3 = [0, 1)^3$ with periodic boundaries.
+A point $z = (z_1, z_2, z_3)$ wraps on each axis.
 
 Geodesic (shortest-path) distance:
 
 $$
-d_{\mathbb{T}}(z, z') = \sqrt{\min(|z_1 - z'_1|, 1 - |z_1 - z'_1|)^2 + \min(|z_2 - z'_2|, 1 - |z_2 - z'_2|)^2}
+d_{\mathbb{T}}(z, z') = \sqrt{\sum_{k=1}^{3}\min(|z_k - z'_k|, 1 - |z_k - z'_k|)^2}
 $$
 
 ### 2.2  Expert Placement
 
-128 experts are placed on an approximately uniform grid:
+128 experts are placed on an approximately uniform lattice:
 
-- $128 = 16 \times 8$ → a $16 \times 8$ grid on $[0, 1)^2$
-- Expert $(i, j)$ is at position $\left(\frac{i}{16}, \frac{j}{8}\right)$ for $i \in [0, 15], j \in [0, 7]$
+- $128 = 8 \times 4 \times 4$ → an $8 \times 4 \times 4$ grid on $[0, 1)^3$
+- Expert $(i, j, k)$ is at position
+  $\left(\frac{i}{8}, \frac{j}{4}, \frac{k}{4}\right)$ for
+  $i \in [0,7], j \in [0,3], k \in [0,3]$
 
 With slight jitter added during training to break symmetry:
 
 $$
-z_{\text{expert}}^{(i,j)} = \left(\frac{i}{16} + \epsilon_1, \; \frac{j}{8} + \epsilon_2\right) \mod 1
+z_{\text{expert}}^{(i,j,k)} = \left(\frac{i}{8} + \epsilon_1, \; \frac{j}{4} + \epsilon_2,\; \frac{k}{4} + \epsilon_3\right) \mod 1
 $$
 
-where $\epsilon_1, \epsilon_2 \sim \mathcal{N}(0, 0.01)$ are learned offsets.
+where $\epsilon_1, \epsilon_2, \epsilon_3 \sim \mathcal{N}(0, 0.01)$ are learned offsets.
 
 ### 2.3  Voronoi Cells
 
 Each expert owns a Voronoi cell on the torus — the set of all points closer
 to it than to any other expert.  For a near-uniform grid, each cell has
-area $\approx \frac{1}{128}$, giving natural load balance.
+volume $\approx \frac{1}{128}$, giving natural load balance.
 
 During training, a **manifold-consistency loss** nudges expert positions so
 that Voronoi cells remain roughly equal:
@@ -94,7 +96,7 @@ At each of the 60 expert FFN layers $\ell$:
 $$
 \begin{aligned}
 z_{\text{query}}^{(\ell)} &= W_{\text{route}}^{(\ell)} \, h_t \mod 1
-& \text{(project to torus, } W_{\text{route}} \in \mathbb{R}^{2 \times d}\text{)} \\[4pt]
+& \text{(project to torus, } W_{\text{route}} \in \mathbb{R}^{3 \times d}\text{)} \\[4pt]
 d_i &= d_{\mathbb{T}}\!\left(z_{\text{query}}, z_{\text{expert}}^{(i)}\right)
 & \text{(distance to each expert)} \\[4pt]
 e^* &= \arg\min_i \; d_i
@@ -106,8 +108,8 @@ The modular arithmetic ($\mod 1$) ensures the query always lands on the torus.
 
 ### 3.2  Routing Cost
 
-- $W_{\text{route}}^{(\ell)}$ is $2 \times 4096 = 8192$ parameters per layer
-- Distance computation: 128 experts × 6 ops = 768 FLOPs (negligible)
+- $W_{\text{route}}^{(\ell)}$ is $3 \times 4096 = 12288$ parameters per layer
+- Distance computation: 128 experts × 9 ops = 1152 FLOPs (negligible)
 - Argmin: 128 comparisons
 - **Total per layer: ~16K FLOPs** — essentially free
 
@@ -131,7 +133,7 @@ an astronomically larger function space through combinatorial composition.
 ### 4.1  The Core Insight
 
 If expert $j$ is a **manifold neighbour** of expert $i$ (one step on the
-16×8 grid), their weights are trained to share structure:
+8×4×4 lattice), their weights are trained to share structure:
 
 $$
 W_j^{(\ell)} = W_i^{(\ell)} + \Delta_{i \to j}^{(\ell)}
@@ -222,23 +224,17 @@ Hyperparameters: $\alpha = 0.01$, $\beta = 0.001$, $\gamma = 0.005$.
 
 ## 6  Manifold Visualisation
 
-The 2-D torus can be unrolled into a flat $[0, 1)^2$ plot:
+The 3-D torus can be visualised as 2-D slices over the third axis:
 
 ```
-z₂ ↑
-  1 ┌──────────────────────────────────┐
-    │  ●   ●   ●   ●   ●   ●   ●   ● │ row 7
-    │  ●   ●   ●   ●   ●   ●   ●   ● │ row 6
-    │  ●   ●   ●   ●   ●   ●   ●   ● │ row 5
-    │  ●   ●   ●   ●   ●   ●   ●   ● │ row 4
-    │  ●   ●   ●   ●   ●   ●   ●   ● │ row 3
-    │  ●   ●   ●   ●   ●   ●   ●   ● │ row 2
-    │  ●   ●   ●   ●   ●   ●   ●   ● │ row 1
-    │  ●   ●   ●   ●   ●   ●   ●   ● │ row 0
-  0 └──────────────────────────────────┘
-    0                                  1 → z₁
-         col 0   col 1  ...  col 15
+slice z=0.125: 8x4 grid
+slice z=0.375: 8x4 grid
+slice z=0.625: 8x4 grid
+slice z=0.875: 8x4 grid
 ```
+
+Routing traces are then interpreted as trajectories across slices, where fold
+updates move experts in-place along wrapped geodesics.
 
 During inference, routing queries $z_{\text{query}}^{(\ell)}(t)$ trace
 paths across this surface.  These paths reveal:
@@ -259,13 +255,13 @@ which expert region the model thinks is most relevant.
 
 | Feature | Switch/Mixtral | Expert Choice | **Manifold (ours)** |
 |---------|---------------|---------------|---------------------|
-| Topology | Flat index | Flat index | 2-D torus |
+| Topology | Flat index | Flat index | 3-D torus |
 | Locality | None | None | **Geodesic distance** |
 | Delta streaming | N/A | N/A | **3-10× less transfer** |
 | Load balance | Aux loss | Token dropping | **Geometric (Voronoi)** |
 | Interpolation | None | Soft routing | **Smooth manifold** |
-| Interpretability | ❌ | ❌ | **✅ 2-D visualisation** |
-| Router params | N × d | N × d | **2 × d** (project to R²) |
+| Interpretability | ❌ | ❌ | **✅ Slice-based manifold visualisation** |
+| Router params | N × d | N × d | **3 × d** (project to R³) |
 
 ---
 

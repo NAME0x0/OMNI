@@ -4,7 +4,9 @@
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{self, D_MODEL, FFN_INTERMEDIATE, N_GQA_LAYERS, N_LAYERS, N_PDR_LAYERS, VOCAB_SIZE};
+use crate::config::{
+    self, D_MODEL, FFN_INTERMEDIATE, N_GQA_LAYERS, N_LAYERS, N_PDR_LAYERS, VOCAB_SIZE,
+};
 use crate::core::pdr::PdrLayer;
 use crate::core::pdr_state::PdrStateBank;
 use crate::core::windowed_gqa::{GqaLayer, KVCacheBank};
@@ -142,8 +144,7 @@ impl PerspectiveModel {
         let mut pdr_idx = 0;
         let mut gqa_idx = 0;
 
-        for (layer_idx, (layer, ffn)) in
-            self.layers.iter().zip(self.shared_ffn.iter()).enumerate()
+        for (layer_idx, (layer, ffn)) in self.layers.iter().zip(self.shared_ffn.iter()).enumerate()
         {
             // Attention / recurrence
             h = match layer {
@@ -208,9 +209,8 @@ fn silu(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
-    use crate::config::{N_PDR_LAYERS, N_GQA_LAYERS};
+
+    use crate::config::{N_GQA_LAYERS, N_PDR_LAYERS};
 
     #[test]
     fn test_model_layer_count() {

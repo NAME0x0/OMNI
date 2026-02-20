@@ -6,7 +6,7 @@
 //! algorithm. This ensures hard safety guarantees that cannot be
 //! gradient-attacked.
 
-pub mod polytope;
 pub mod anchors;
 pub mod halfspace;
+pub mod polytope;
 pub mod projection;

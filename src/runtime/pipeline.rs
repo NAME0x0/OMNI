@@ -2,13 +2,14 @@
 //!
 //! Orchestrates all 7 novel components:
 //! 1. PDR (O(1) recurrence) + GQA (windowed attention) — core layers
-//! 2. Manifold routing (flat torus T²) — expert selection
+//! 2. Manifold routing (flat torus T^3) — expert selection
 //! 3. Ternary execution (1.58-bit weights) — compute
 //! 4. HDM (hyperdimensional memory) — episodic memory
 //! 5. MPD (multi-perspective decoding) — verification
 //! 6. FMEA (forward-mode adaptation) — continual learning
 //! 7. SPP (safety polytope projection) — hard safety
 
+use anyhow::{bail, Result};
 use ndarray::Array1;
 
 /// Pipeline configuration.
@@ -176,21 +177,28 @@ impl InferencePipeline {
     /// 7. Return selected token
     pub fn process_token(
         &mut self,
-        _token_id: usize,
-        _hidden_state: &mut Array1<f32>,
-    ) -> TokenResult {
-        self.tokens_generated += 1;
-
-        // Skeleton: in a full implementation, each stage would call
-        // the respective subsystems. This structure defines the interface.
-        TokenResult {
-            token_id: 0,
-            probability: 0.0,
-            mpd_agreed: true,
-            safety_score: 1.0,
-            expert_id: 0,
-            routing_trace: Vec::new(),
+        token_id: usize,
+        hidden_state: &mut Array1<f32>,
+    ) -> Result<TokenResult> {
+        if token_id >= self.config.vocab_size {
+            bail!(
+                "token_id {} out of range for vocab_size {}",
+                token_id,
+                self.config.vocab_size
+            );
         }
+
+        if hidden_state.len() != self.config.d_model {
+            bail!(
+                "hidden_state length {} does not match d_model {}",
+                hidden_state.len(),
+                self.config.d_model
+            );
+        }
+
+        bail!(
+            "InferencePipeline::process_token is not implemented; refusing to return placeholder output"
+        );
     }
 
     /// Generate a sequence of tokens (autoregressive).
@@ -199,7 +207,17 @@ impl InferencePipeline {
         prompt_tokens: &[usize],
         max_tokens: usize,
         stop_token: usize,
-    ) -> GenerationResult {
+    ) -> Result<GenerationResult> {
+        self.try_generate(prompt_tokens, max_tokens, stop_token)
+    }
+
+    /// Fallible generation API.
+    pub fn try_generate(
+        &mut self,
+        prompt_tokens: &[usize],
+        max_tokens: usize,
+        stop_token: usize,
+    ) -> Result<GenerationResult> {
         let start = std::time::Instant::now();
         let mut generated = Vec::new();
         let mut results = Vec::new();
@@ -208,14 +226,14 @@ impl InferencePipeline {
 
         // Process prompt (prefill)
         for &tok in prompt_tokens {
-            let result = self.process_token(tok, &mut hidden);
+            let result = self.process_token(tok, &mut hidden)?;
             results.push(result);
         }
 
         // Generate new tokens
         for _ in 0..max_tokens {
             let last_token = generated.last().copied().unwrap_or(0);
-            let result = self.process_token(last_token, &mut hidden);
+            let result = self.process_token(last_token, &mut hidden)?;
             let token_id = result.token_id;
             generated.push(token_id);
             results.push(result);
@@ -240,7 +258,7 @@ impl InferencePipeline {
             results.iter().filter(|r| r.mpd_agreed).count() as f32 / results.len() as f32
         };
 
-        GenerationResult {
+        Ok(GenerationResult {
             tokens: generated,
             token_results: results,
             total_time_ms: elapsed,
@@ -251,7 +269,7 @@ impl InferencePipeline {
             },
             avg_safety_score: avg_safety,
             mpd_agreement_rate: mpd_rate,
-        }
+        })
     }
 
     /// Reset pipeline state for a new conversation.
@@ -286,8 +304,8 @@ mod tests {
         let mut pipeline = InferencePipeline::new(config);
         let mut hidden = Array1::zeros(32);
         let result = pipeline.process_token(42, &mut hidden);
-        assert_eq!(pipeline.tokens_generated(), 1);
-        assert!(result.safety_score >= 0.0);
+        assert!(result.is_err());
+        assert_eq!(pipeline.tokens_generated(), 0);
     }
 
     #[test]
@@ -298,9 +316,8 @@ mod tests {
             ..Default::default()
         };
         let mut pipeline = InferencePipeline::new(config);
-        let result = pipeline.generate(&[1, 2, 3], 5, 0);
-        assert!(result.tokens.len() <= 5);
-        assert!(result.total_time_ms >= 0.0);
+        let result = pipeline.try_generate(&[1, 2, 3], 5, 0);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -310,11 +327,11 @@ mod tests {
             ..Default::default()
         };
         let mut pipeline = InferencePipeline::new(config);
-        let mut hidden = Array1::zeros(16);
-        pipeline.process_token(1, &mut hidden);
-        assert_eq!(pipeline.tokens_generated(), 1);
+        pipeline.tokens_generated = 3;
+        pipeline.cumulative_timings.total_us = 42;
         pipeline.reset();
         assert_eq!(pipeline.tokens_generated(), 0);
+        assert_eq!(pipeline.cumulative_timings.total_us, 0);
     }
 
     #[test]

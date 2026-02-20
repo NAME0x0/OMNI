@@ -34,8 +34,8 @@
 
 | Test | Input | Expected |
 |------|-------|----------|
-| Torus wrap-around | Position (0.99, 0.5) + delta (0.05, 0) | Position (0.04, 0.5) |
-| Geodesic distance | Pos A, Pos B | $d_T = \sqrt{\min(|x|,1-|x|)^2 + \min(|y|,1-|y|)^2}$ |
+| Torus wrap-around | Position (0.99, 0.5, 0.99) + delta (0.05, 0, 0.04) | Position (0.04, 0.5, 0.03) |
+| Geodesic distance | Pos A, Pos B | $d_T = \sqrt{\min(|x|,1-|x|)^2 + \min(|y|,1-|y|)^2 + \min(|z|,1-|z|)^2}$ |
 | Load balance | 10K random tokens | Gini coefficient < 0.15 |
 | Deterministic routing | Same input twice | Same expert selected |
 | All experts reachable | 100K random inputs | All 128 experts selected ≥ 1× |
