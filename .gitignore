@@ -1,0 +1,31 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Environment
+.env
+.env.*
+
+# Model weights & checkpoints
+*.bin
+*.safetensors
+*.gguf
+*.pt
+*.onnx
+checkpoints/
+
+# Logs
+*.log
