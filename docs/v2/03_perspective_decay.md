@@ -14,17 +14,22 @@ Current sequence mechanisms fall into three camps:
 | Linear recurrence (RetNet, RWKV, Mamba) | O(n d²) | Fixed / input-gated decay — no perspective |
 | Linear attention (Performer, cosFormer) | O(n d²) | Kernel approximation loses sharpness |
 
-**PDR is different:** it introduces a *perspective projection* W_p that first
-maps the input into a d-dimensional perspective space.  This perspective
-vector p_t then generates the decay gate γ_t.  The conceptual shift:
+**PDR is a GLA-family gated linear recurrence.**  Its gate has the same
+functional form as GLA's input-dependent gate: a sigmoid of a linear
+projection.  The distinguishing design choice is that PDR uses a full-rank
+d×d gate ("perspective") projection instead of a low-rank gate.  Whether
+full-rank gating improves quality at equal parameter count is an open
+empirical question; Stage 0 of the training plan (Section 10) gates on
+exactly this comparison.  The lens metaphor is the motivation:
 
 > RetNet / GLA: "Given this input, how much do I forget?"
 > Mamba: "Given this input, which dimensions do I select?"
 > **PDR**: "Given this input, **what lens do I apply** — and that lens
 > determines what I forget, remember, and retrieve?"
 
-Each of the 60 PDR layers learns a different "lens."  Layer 3 might learn a
-syntactic perspective; layer 40 a semantic one; layer 55 a reasoning one.
+Each of the 60 PDR layers is designed to learn a different "lens."  Layer 3
+might learn a syntactic perspective; layer 40 a semantic one; layer 55 a
+reasoning one.
 
 ---
 
@@ -75,6 +80,10 @@ in $O(\log L)$ sequential steps using $O(L \cdot d \cdot r)$ total work.
 Chunk size $L = 256$ (tunable).  Within a chunk: parallel scan.  Across
 chunks: sequential state passing.
 
+Implementation note: the current CPU reference path uses a sequential loop
+in `src/core/pdr.rs` (`forward_prefill`).  The $O(\log L)$ parallel scan is
+designed but not implemented.
+
 ---
 
 ## 3  What Makes PDR Novel
@@ -88,33 +97,35 @@ In existing gated recurrences:
 | RetNet | $\gamma = \text{fixed constant}$ | No adaptivity |
 | GLA | $\gamma_t = \sigma(W_g \, x_t)$ | Input-dependent gate |
 | Mamba | $\Delta_t = \text{softplus}(W_\Delta \, x_t)$; discretised | Continuous-time selection |
-| **PDR** | $p_t = W_p \, x_t$; $\gamma_t = \sigma(p_t)$ | Two-stage: perspective → decay |
+| **PDR** | $p_t = W_p \, x_t$; $\gamma_t = \sigma(p_t)$ | Full-rank gate projection |
 
+PDR has the same gate function class as GLA: $\sigma(\text{linear}(x))$.
 The critical difference is that $W_p$ is a **full d×d matrix** (16.78M params),
-not a small gate projection.  It transforms the input into a completely new
-representation space before deriving the decay.  This is functionally
-equivalent to applying a learned "lens" or "viewpoint" to the input.
+not a low-rank or small gate projection.  It gives the gate more capacity
+within that same function class.  Whether this improves quality at equal
+parameter count is an open empirical question; Stage 0 of the training plan
+(Section 10) gates on exactly this comparison.
 
 ### 3.2  Why the Extra Transformation Matters
 
 Consider two inputs $x_a$ and $x_b$ that are similar in model space but should
 trigger different memory behaviours (e.g., "the cat sat" vs "the cat died"):
 
-- GLA computes $\sigma(W_g \, x)$ — a linear function of $x$.  Similar $x$
-  get similar gates.
-- PDR computes $\sigma(W_p \, x)$ — also linear, but the d×d matrix has
-  16M parameters to learn a rotational view where the two inputs *separate*.
-  The perspective projection can implement arbitrary rotations, scalings, and
-  axis-aligned separations in d-dimensional space.
+- GLA computes $\sigma(W_g \, x)$ — a sigmoid of a linear function of $x$.
+- PDR computes $\sigma(W_p \, x)$ — the same function class, but the d×d
+  matrix has 16M parameters to learn a rotational view where the two inputs
+  *separate*.  The perspective projection can implement arbitrary rotations,
+  scalings, and axis-aligned separations in d-dimensional space.
 
-With a small gate vector (GLA uses ~$d$ parameters for the gate), the model
-can only modulate decay along the same axes as the input.  With d×d, PDR can
-modulate along *any* learned axis.
+The claim is therefore not mechanism novelty.  The claim is gate capacity
+within the shared $\sigma(\text{linear}(x))$ class: with a small gate vector,
+the model has fewer learned directions for decay modulation; with d×d, PDR
+can modulate along *any* learned axis.
 
-### 3.3  Multi-Layer Perspective Diversity
+### 3.3  Multi-Layer Perspective Diversity (Speculative - no trained model exists to verify this)
 
-Each of the 60 PDR layers has its own $W_p$.  Through training, these
-naturally specialise:
+Each of the 60 PDR layers has its own $W_p$.  The intended behaviour is that
+through training, these may specialise:
 
 - Early layers: perspectives that track **syntactic structure** (open brackets,
   clause boundaries, verb tense).
@@ -231,7 +242,7 @@ decay — mitigated by:
 
 1. The 3:1 PDR/GQA ratio: GQA layers provide skip-connection-like direct
    gradient paths every 4 layers.
-2. Initialising $b_\gamma$ so that $\sigma(b_\gamma) \approx 0.95$ — slow
+2. Initialising $b_p$ so that $\sigma(b_p) \approx 0.95$ — slow
    initial decay, fast information flow.
 
 ---

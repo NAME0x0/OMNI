@@ -1,7 +1,8 @@
 # § 09 — Safety Polytope Projection (SPP)
 
 > Safety isn't a penalty to optimise against.
-> It's a hard geometric wall that cannot be gradient-attacked.
+> A hard geometric constraint on where outputs can live.
+> Membership is guaranteed; safety must still be earned.
 
 ---
 
@@ -21,14 +22,16 @@ that can be circumvented because the model's output space is unconstrained.
 
 ### The SPP Approach
 
-Define a **convex polytope** in embedding space containing only safe outputs.
+Define a **convex polytope** in embedding space intended to contain safe outputs.
 Project every output embedding onto this polytope.  If the embedding is
 already inside → no change.  If outside → clamp to the nearest face.
 
 Key properties:
-- **Hard constraint:** the output physically cannot leave the polytope
-- **Non-differentiable:** projection involves argmin over half-spaces →
-  gradient-based attacks get zero useful gradient
+- **Hard membership constraint:** the projected embedding cannot leave the
+  half-space polytope when projection converges
+- **Attack surface still exists:** half-space projection is piecewise-linear
+  and differentiable almost everywhere; BPDA-style and gradient-free attacks
+  still apply
 - **Composable:** the polytope can be refined by adding/removing anchors
   without retraining
 
@@ -60,8 +63,12 @@ $$
 \mathcal{P} = \text{conv}(a_1, \ldots, a_{1000}) = \left\{ \sum_{i=1}^{1000} \lambda_i a_i \;\middle|\; \lambda_i \geq 0, \sum_i \lambda_i = 1 \right\}
 $$
 
-Any point inside $\mathcal{P}$ is a convex combination of safe embeddings →
-it can only produce tokens that are weighted mixtures of safe vocabulary.
+Any point inside $\mathcal{P}$ is a convex combination of the selected anchor
+embeddings.  This constrains the geometry of the output embedding, but it does
+**not** prove token-level safety: logits are still computed by dot products
+against every token embedding, so a point in the hull can assign high logits to
+tokens outside the anchor set.  The link between hull membership and safe text
+is a design hypothesis that requires red-team validation.
 
 ### 2.3  Half-Space Representation
 
@@ -94,17 +101,37 @@ fn project_to_polytope(e: &[f32; 4096], normals: &[[f32; 4096]; 500],
                         offsets: &[f32; 500]) -> [f32; 4096] {
     let mut x = e.clone();
     
-    // Dykstra's alternating projection (5 iterations suffice)
-    for _iter in 0..5 {
+    // Full Dykstra projection with correction terms.
+    // Default: max 50 iterations, tolerance 1e-6, early exit on convergence.
+    let mut p = [[0.0; 4096]; 500];
+    for _iter in 0..50 {
+        let x_start = x.clone();
         for j in 0..500 {
-            let dot = inner_product(&x, &normals[j]);
+            let x_prev = x.clone();
+            let mut y = x.clone();
+            for d in 0..4096 {
+                y[d] += p[j][d];
+            }
+
+            let dot = inner_product(&y, &normals[j]);
             if dot > offsets[j] {
                 // Project onto half-space j
                 let violation = dot - offsets[j];
+                let norm_sq = inner_product(&normals[j], &normals[j]);
                 for d in 0..4096 {
-                    x[d] -= violation * normals[j][d];
+                    y[d] -= (violation / norm_sq) * normals[j][d];
                 }
             }
+
+            // p_j = (x_prev + p_j) - y
+            for d in 0..4096 {
+                p[j][d] = (x_prev[d] + p[j][d]) - y[d];
+                x[d] = y[d];
+            }
+        }
+
+        if l2_distance(&x, &x_start) < 1e-6 {
+            break;
         }
     }
     
@@ -114,26 +141,33 @@ fn project_to_polytope(e: &[f32; 4096], normals: &[[f32; 4096]; 500],
 
 ### 3.2  Complexity
 
-- Per half-space check: 4,096 multiplies + 1 compare = 8,193 FLOPs
-- Per iteration: 500 half-spaces × 8,193 = 4.1M FLOPs
-- 5 iterations: **20.5M FLOPs total**
-- At GPU speed: < 0.01 ms (negligible)
+- Per half-space check: ~4,096 multiply-adds + 1 compare ≈ 8.2K FLOPs
+- Active half-space projection: another ~8.2K FLOPs for the vector update
+- Per iteration check cost: 500 half-spaces × ~8.2K ≈ 4.1M FLOPs,
+  plus correction/projection work for active constraints
+- Default iteration budget: up to **50 iterations** at tolerance `1e-6`
+  (`crate::config::SPP_ITERATIONS`, `ProjectionConfig::default`)
+- Worst-case check-only budget at 50 iterations: ~205M FLOPs; actual cost is
+  adaptive because the implementation exits early on convergence
+- Latency is a projection until benchmarked in the end-to-end runtime
 
 ### 3.3  Convergence
 
 Dykstra's algorithm converges to the true projection onto the intersection
-of convex sets.  With 5 iterations and 500 half-spaces, residual error is:
+of convex sets.  The CPU reference implementation uses a maximum of 50
+iterations and stops when the L2 change between iterations falls below
+`1e-6`.
 
 $$
-\| x_5 - x^* \| \leq \epsilon \cdot \| e - x^* \|, \quad \epsilon \approx 10^{-3}
+\| x_t - x_{t-1} \|_2 < 10^{-6}
 $$
 
-This is more than sufficient — a 0.1% error in the output embedding has
-negligible effect on the token distribution.
+Whether that residual is sufficient for token-level behaviour is an empirical
+question; it should be checked in validation alongside red-team tests.
 
 ---
 
-## 4  Why SPP Cannot Be Gradient-Attacked
+## 4  What SPP Does and Does Not Guarantee
 
 ### 4.1  The Problem with Differentiable Safety
 
@@ -148,27 +182,29 @@ An adversary can compute $\nabla_{\text{input}} \text{safety\_score}$ and
 find inputs that minimise the safety score while maximising harmful content.
 This is exactly how jailbreaks work.
 
-### 4.2  SPP's Non-Differentiability
+### 4.2  Projection Is Not an Attack-Proof Barrier
 
 SPP applies **after** the model's forward pass:
 
 ```
 logit_embedding = model(input)           // differentiable up to here
-safe_embedding = project(logit_embedding) // NON-DIFFERENTIABLE
+safe_embedding = project(logit_embedding) // piecewise-linear projection
 output_tokens = sample(safe_embedding)    // discrete sampling
 ```
 
-The projection involves:
-- Conditional branches (`if dot > offset`)
-- Argmin over violated half-spaces
-- Iterative refinement (not a closed-form function)
+Projection onto one half-space has the closed form:
 
-An adversary computing $\frac{\partial \text{output}}{\partial \text{input}}$
-gets **zero gradient** through the projection step.  The adversary cannot
-learn which input perturbations will move the output past the safety boundary,
-because the boundary is invisible to gradient computation.
+$$
+\Pi(x) = x - \max\left(0, \frac{a \cdot x - b}{\|a\|^2}\right)a
+$$
 
-### 4.3  Robustness Guarantee
+This map is piecewise-linear and differentiable almost everywhere.  Its
+Jacobian is $I$ when the constraint is inactive and
+$I - aa^T / \|a\|^2$ when the constraint is active.  It is not a zero-gradient
+wall.  Adaptive attacks can use BPDA-style approximations, gradients through
+the differentiable upstream model, or gradient-free search.
+
+### 4.3  Membership Guarantee
 
 **Theorem (informal):** For any input $x$, the output of SPP satisfies:
 
@@ -177,12 +213,15 @@ $$
 $$
 
 regardless of $x$.  There is no input that can produce an output outside
-$\mathcal{P}$.  This is a **unconditional guarantee**, not a statistical one.
+$\mathcal{P}$.  This is an unconditional **membership** guarantee, not a
+semantic safety guarantee.  The implementation also re-projects after its
+optional hull-blend step to preserve half-space feasibility.
 
 The only way to defeat SPP is to find a harmful output that lies *inside*
-the safe polytope — i.e., a harmful message that is a convex combination
-of the 1,000 safe anchors.  This is possible but very difficult when the
-anchors are carefully chosen.
+the enforced polytope.  That is possible: membership is a geometric predicate,
+not a proof that the sampled text is harmless.  It is also easier to imagine
+inside the $\epsilon$-inflated polytope used in § 7.3 than inside the exact
+anchor hull, so the size of that inflated region must be red-team validated.
 
 ---
 
@@ -210,7 +249,7 @@ Anchors are specifically **not** placed near embeddings of:
 Phase 1: Initial anchor set from safe vocabulary (automated)
 Phase 2: Red-team testing → identify leaks → add blocking anchors
 Phase 3: Shrink polytope around discovered harmful embeddings
-Phase 4: Repeat until red-team pass rate ≥ 98%
+Phase 4: Repeat until target red-team pass rate ≥ 98%
 ```
 
 ### 5.4  Dynamic Anchor Update
@@ -234,7 +273,7 @@ This allows the safety boundary to evolve with discovered threats.
 |-----------|-------------|
 | **MPD** | SPP runs after MPD token selection. If MPD flags uncertainty AND SPP projects significantly, the token is blocked entirely. |
 | **HDM** | SPP anchors can reference HDM entries: "this fact is safe to state." |
-| **FMEA** | LoRA adaptation never modifies the SPP polytope. Safety is independent of learning. |
+| **FMEA** | LoRA adaptation does not directly modify the SPP polytope. The intended separation reduces one coupling path, but safety under adaptation still requires validation. |
 | **Manifold Router** | If a routing path consistently triggers SPP projections, the router learns to avoid that expert region (via NES fitness). |
 
 ---
@@ -276,7 +315,9 @@ $$
 
 where $\epsilon$ is an inflation parameter that expands each half-space.
 $\epsilon = 0.5$ gives a comfortable margin that includes most safe outputs
-while still excluding the dangerous regions.
+while still aiming to exclude dangerous regions.  This larger region weakens
+the simple "convex combination of safe anchors" intuition, so it must be tuned
+against both false positives and harmful in-polytope outputs.
 
 ---
 
@@ -284,13 +325,13 @@ while still excluding the dangerous regions.
 
 | Metric | Value |
 |--------|-------|
-| FLOPs per token | 20.5 M (negligible vs 15.8B model) |
-| Latency | < 0.01 ms |
+| FLOPs per token | Projected: ~4.1M check FLOPs per iteration; up to ~205M check FLOPs at 50 iterations, plus active projection work |
+| Latency | Projected; unmeasured end-to-end |
 | RAM for anchors + half-spaces | 24 MB |
 | VRAM | 0 (runs on CPU, result copied to GPU for sampling) |
-| Adversarial robustness | Zero gradient through projection |
-| False positive rate (safe content blocked) | ≤ 2% with context-aware switching |
-| Red-team block rate | ≥ 98% |
+| Adversarial robustness | Membership guarantee; not attack-immune (see § 4) |
+| False positive rate (safe content blocked) | Target: ≤ 2% with context-aware switching |
+| Red-team block rate | Target: ≥ 98% |
 
 ---
 

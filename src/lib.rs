@@ -7,18 +7,18 @@
 //!
 //! 1. **PDR** — Perspective Decay Recurrence (O(1) sequence processing)
 //! 2. **Manifold Routing** — Expert selection on a 3D flat torus
-//! 3. **Ternary Execution** — Natively {-1, 0, +1} weights at 1.58 bits/param
+//! 3. **Ternary Execution** — Natively {-1, 0, +1} weights stored at 1.6 bits/param
 //! 4. **HDM** — Holographic Distributed Memory (hyperdimensional long-term memory)
-//! 5. **MPD** — Multi-Perspective Decoding (4-perspective calibrated generation)
-//! 6. **FMEA** — Forward-Mode Evolutionary Adaptation (online learning, 11 MB)
-//! 7. **SPP** — Safety Polytope Projection (non-differentiable safety constraints)
+//! 5. **MPD** — Multi-Perspective Decoding (4-perspective decoding, calibration hypothesis)
+//! 6. **FMEA** — Forward-Mode Evolutionary Adaptation (online learning via LoRA + JVP + NES)
+//! 7. **SPP** — Safety Polytope Projection (hard geometric output-membership constraint)
 //!
 //! ## Architecture
 //!
 //! - 80 layers: 60 PDR + 20 windowed GQA (period-4 interleave)
 //! - 128 experts (8.12B params each), top-1 routing
 //! - 14.95B active parameters per token
-//! - Total: 1.05T parameters in ~230 GB on NVMe
+//! - Total: 1.05T parameters in ~208 GB experts (+~40 GB deltas) on NVMe at 1.6 bits/param
 
 pub mod core;
 pub mod decoding;
@@ -121,8 +121,10 @@ pub mod config {
     /// SPP half-space facet count.
     pub const SPP_FACETS: usize = 500;
 
-    /// SPP Dykstra iterations.
-    pub const SPP_ITERATIONS: usize = 5;
+    /// SPP Dykstra iterations. Matches `ProjectionConfig::default()` in
+    /// `safety::projection` (single source of truth); 5 iterations was found
+    /// to be insufficient for convergence at the default tolerance (1e-6).
+    pub const SPP_ITERATIONS: usize = 50;
 
     /// SPP epsilon (polytope inflation).
     pub const SPP_EPSILON: f32 = 0.5;

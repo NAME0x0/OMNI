@@ -1,14 +1,12 @@
 //! Windowed Grouped-Query Attention (GQA).
 //!
 //! Optimisations:
-//! 1. Windowed attention over last `GQA_WINDOW` tokens.
-//! 2. Grouped queries: `GQA_Q_HEADS` query heads share `GQA_KV_HEADS` KV heads.
+//! 1. Windowed attention over last `window` tokens.
+//! 2. Grouped queries: `q_heads` query heads share `kv_heads` KV heads.
 //! 3. RoPE positional encoding on q/k before attention scoring.
 
 use ndarray::{s, Array1, Array2, Array3};
 use serde::{Deserialize, Serialize};
-
-use crate::config::{D_MODEL, GQA_KV_HEADS, GQA_Q_HEADS, GQA_WINDOW, HEAD_DIM};
 
 const ROPE_BASE: f32 = 10_000.0;
 
@@ -24,7 +22,7 @@ pub struct KVCache {
     /// Current write position (wraps around).
     pub pos: usize,
 
-    /// Number of valid entries (up to WINDOW).
+    /// Number of valid entries (up to window).
     pub len: usize,
 
     /// Number of KV entries ever inserted (absolute token position tracker).
@@ -32,14 +30,21 @@ pub struct KVCache {
 }
 
 impl KVCache {
-    pub fn new() -> Self {
+    /// Create a new zero-initialised cache sized for `window` tokens across
+    /// `kv_heads` heads of dimension `head_dim`.
+    pub fn new(window: usize, kv_heads: usize, head_dim: usize) -> Self {
         Self {
-            keys: Array3::zeros((GQA_WINDOW, GQA_KV_HEADS, HEAD_DIM)),
-            values: Array3::zeros((GQA_WINDOW, GQA_KV_HEADS, HEAD_DIM)),
+            keys: Array3::zeros((window, kv_heads, head_dim)),
+            values: Array3::zeros((window, kv_heads, head_dim)),
             pos: 0,
             len: 0,
             tokens_seen: 0,
         }
+    }
+
+    /// Window size, derived from the cache's own array shape.
+    fn window(&self) -> usize {
+        self.keys.shape()[0]
     }
 
     /// Absolute position for the next token that will be inserted.
@@ -50,10 +55,11 @@ impl KVCache {
     /// Insert a new KV pair.
     pub fn insert(&mut self, k: &Array2<f32>, v: &Array2<f32>) {
         // k, v: [kv_heads, head_dim]
+        let window = self.window();
         self.keys.slice_mut(s![self.pos, .., ..]).assign(k);
         self.values.slice_mut(s![self.pos, .., ..]).assign(v);
-        self.pos = (self.pos + 1) % GQA_WINDOW;
-        if self.len < GQA_WINDOW {
+        self.pos = (self.pos + 1) % window;
+        if self.len < window {
             self.len += 1;
         }
         self.tokens_seen = self.tokens_seen.saturating_add(1);
@@ -61,14 +67,16 @@ impl KVCache {
 
     /// Get valid keys: [len, kv_heads, head_dim]
     pub fn get_keys(&self) -> Array3<f32> {
-        if self.len < GQA_WINDOW {
+        let window = self.window();
+        if self.len < window {
             self.keys.slice(s![..self.len, .., ..]).to_owned()
         } else {
             // Ring buffer: reorder so oldest is first
             let start = self.pos; // oldest entry
-            let mut out = Array3::zeros((GQA_WINDOW, GQA_KV_HEADS, HEAD_DIM));
-            for i in 0..GQA_WINDOW {
-                let src = (start + i) % GQA_WINDOW;
+            let (_, kv_heads, head_dim) = self.keys.dim();
+            let mut out = Array3::zeros((window, kv_heads, head_dim));
+            for i in 0..window {
+                let src = (start + i) % window;
                 out.slice_mut(s![i, .., ..])
                     .assign(&self.keys.slice(s![src, .., ..]));
             }
@@ -78,13 +86,15 @@ impl KVCache {
 
     /// Get valid values: [len, kv_heads, head_dim]
     pub fn get_values(&self) -> Array3<f32> {
-        if self.len < GQA_WINDOW {
+        let window = self.window();
+        if self.len < window {
             self.values.slice(s![..self.len, .., ..]).to_owned()
         } else {
             let start = self.pos;
-            let mut out = Array3::zeros((GQA_WINDOW, GQA_KV_HEADS, HEAD_DIM));
-            for i in 0..GQA_WINDOW {
-                let src = (start + i) % GQA_WINDOW;
+            let (_, kv_heads, head_dim) = self.values.dim();
+            let mut out = Array3::zeros((window, kv_heads, head_dim));
+            for i in 0..window {
+                let src = (start + i) % window;
                 out.slice_mut(s![i, .., ..])
                     .assign(&self.values.slice(s![src, .., ..]));
             }
@@ -102,13 +112,7 @@ impl KVCache {
 
     /// Memory footprint in bytes.
     pub fn size_bytes(&self) -> usize {
-        2 * GQA_WINDOW * GQA_KV_HEADS * HEAD_DIM * std::mem::size_of::<f32>()
-    }
-}
-
-impl Default for KVCache {
-    fn default() -> Self {
-        Self::new()
+        (self.keys.len() + self.values.len()) * std::mem::size_of::<f32>()
     }
 }
 
@@ -130,35 +134,59 @@ pub struct GqaLayer {
     /// RMSNorm scale for pre-norm.
     pub rms_scale: Array1<f32>,
 
+    /// Number of query heads.
+    pub q_heads: usize,
+
+    /// Number of key/value heads.
+    pub kv_heads: usize,
+
+    /// Per-head dimension.
+    pub head_dim: usize,
+
     /// Layer index.
     pub layer_idx: usize,
 }
 
 impl GqaLayer {
-    /// Create with zero weights.
-    pub fn zeros(layer_idx: usize) -> Self {
-        let q_dim = GQA_Q_HEADS * HEAD_DIM;
-        let kv_dim = GQA_KV_HEADS * HEAD_DIM;
+    /// Create with zero weights, sized for the given `d_model`, `q_heads`,
+    /// `kv_heads`, and `head_dim`.
+    pub fn zeros(
+        layer_idx: usize,
+        d_model: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        let q_dim = q_heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
         Self {
-            w_q: Array2::zeros((q_dim, D_MODEL)),
-            w_k: Array2::zeros((kv_dim, D_MODEL)),
-            w_v: Array2::zeros((kv_dim, D_MODEL)),
-            w_o: Array2::zeros((D_MODEL, q_dim)),
-            rms_scale: Array1::ones(D_MODEL),
+            w_q: Array2::zeros((q_dim, d_model)),
+            w_k: Array2::zeros((kv_dim, d_model)),
+            w_v: Array2::zeros((kv_dim, d_model)),
+            w_o: Array2::zeros((d_model, q_dim)),
+            rms_scale: Array1::ones(d_model),
+            q_heads,
+            kv_heads,
+            head_dim,
             layer_idx,
         }
     }
 
+    /// This layer's `d_model`, derived from the stored weight shapes.
+    fn d_model(&self) -> usize {
+        self.rms_scale.len()
+    }
+
     /// Single-token forward pass with KV cache update.
     pub fn forward_step(&self, h: &Array1<f32>, cache: &mut KVCache) -> Array1<f32> {
-        if h.len() != D_MODEL {
+        if h.len() != self.d_model() {
             return h.clone();
         }
 
-        if GQA_KV_HEADS == 0 || GQA_Q_HEADS % GQA_KV_HEADS != 0 {
+        if self.kv_heads == 0 || self.q_heads % self.kv_heads != 0 {
             return h.clone();
         }
-        let group_size = GQA_Q_HEADS / GQA_KV_HEADS;
+        let group_size = self.q_heads / self.kv_heads;
 
         let h_norm = rms_norm(h, &self.rms_scale);
 
@@ -168,15 +196,15 @@ impl GqaLayer {
         let v_flat = self.w_v.dot(&h_norm); // [kv_heads * head_dim]
 
         // Checked reshapes; on failure, fallback to residual path.
-        let mut q_2d = match reshape_heads(q_flat, GQA_Q_HEADS, HEAD_DIM) {
+        let mut q_2d = match reshape_heads(q_flat, self.q_heads, self.head_dim) {
             Some(v) => v,
             None => return h.clone(),
         };
-        let mut k_2d = match reshape_heads(k_flat, GQA_KV_HEADS, HEAD_DIM) {
+        let mut k_2d = match reshape_heads(k_flat, self.kv_heads, self.head_dim) {
             Some(v) => v,
             None => return h.clone(),
         };
-        let v_2d = match reshape_heads(v_flat, GQA_KV_HEADS, HEAD_DIM) {
+        let v_2d = match reshape_heads(v_flat, self.kv_heads, self.head_dim) {
             Some(v) => v,
             None => return h.clone(),
         };
@@ -195,10 +223,10 @@ impl GqaLayer {
         let cache_len = cached_k.shape()[0];
 
         // Compute attention for each query head.
-        let mut attn_out = Array1::zeros(GQA_Q_HEADS * HEAD_DIM);
-        let scale = (HEAD_DIM as f32).sqrt();
+        let mut attn_out = Array1::zeros(self.q_heads * self.head_dim);
+        let scale = (self.head_dim as f32).sqrt();
 
-        for qh in 0..GQA_Q_HEADS {
+        for qh in 0..self.q_heads {
             let kv_idx = qh / group_size; // Which KV head this Q head uses
             let q = q_2d.row(qh); // [head_dim]
 
@@ -211,15 +239,15 @@ impl GqaLayer {
 
             // Softmax + weighted value sum.
             let scores = softmax(&scores);
-            let mut head_out = Array1::zeros(HEAD_DIM);
+            let mut head_out = Array1::zeros(self.head_dim);
             for t in 0..cache_len {
                 let v_t = cached_v.slice(s![t, kv_idx, ..]);
                 head_out = head_out + &(v_t.to_owned() * scores[t]);
             }
 
             // Write head output.
-            let start = qh * HEAD_DIM;
-            for d in 0..HEAD_DIM {
+            let start = qh * self.head_dim;
+            for d in 0..self.head_dim {
                 attn_out[start + d] = head_out[d];
             }
         }
@@ -231,12 +259,7 @@ impl GqaLayer {
 
     /// Parameter count for this layer.
     pub fn param_count(&self) -> usize {
-        let q = GQA_Q_HEADS * HEAD_DIM * D_MODEL;
-        let k = GQA_KV_HEADS * HEAD_DIM * D_MODEL;
-        let v = GQA_KV_HEADS * HEAD_DIM * D_MODEL;
-        let o = D_MODEL * GQA_Q_HEADS * HEAD_DIM;
-        let rms = D_MODEL;
-        q + k + v + o + rms
+        self.w_q.len() + self.w_k.len() + self.w_v.len() + self.w_o.len() + self.rms_scale.len()
     }
 }
 
@@ -250,7 +273,8 @@ fn reshape_heads(x: Array1<f32>, rows: usize, cols: usize) -> Option<Array2<f32>
 
 /// Apply RoPE in-place to `[heads, head_dim]`.
 fn apply_rope(x: &mut Array2<f32>, position: usize) {
-    let pairs = HEAD_DIM / 2;
+    let head_dim = x.ncols();
+    let pairs = head_dim / 2;
     if pairs == 0 {
         return;
     }
@@ -260,7 +284,7 @@ fn apply_rope(x: &mut Array2<f32>, position: usize) {
     let mut sin_cache = vec![0.0; pairs];
 
     for i in 0..pairs {
-        let exponent = (2 * i) as f32 / HEAD_DIM as f32;
+        let exponent = (2 * i) as f32 / head_dim as f32;
         let theta = pos / ROPE_BASE.powf(exponent);
         cos_cache[i] = theta.cos();
         sin_cache[i] = theta.sin();
@@ -311,9 +335,11 @@ pub struct KVCacheBank {
 }
 
 impl KVCacheBank {
-    pub fn new(n: usize) -> Self {
+    /// Create a bank of `n` zero-initialised caches, each sized for `window`
+    /// tokens across `kv_heads` heads of dimension `head_dim`.
+    pub fn new(n: usize, window: usize, kv_heads: usize, head_dim: usize) -> Self {
         Self {
-            caches: (0..n).map(|_| KVCache::new()).collect(),
+            caches: (0..n).map(|_| KVCache::new(window, kv_heads, head_dim)).collect(),
         }
     }
 
@@ -331,12 +357,19 @@ impl KVCacheBank {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ModelDims;
+
+    fn tiny_cache() -> KVCache {
+        let dims = ModelDims::tiny();
+        KVCache::new(dims.gqa_window, dims.gqa_kv_heads, dims.head_dim())
+    }
 
     #[test]
     fn test_kv_cache_insert() {
-        let mut cache = KVCache::new();
-        let k = Array2::ones((GQA_KV_HEADS, HEAD_DIM));
-        let v = Array2::ones((GQA_KV_HEADS, HEAD_DIM));
+        let dims = ModelDims::tiny();
+        let mut cache = tiny_cache();
+        let k = Array2::ones((dims.gqa_kv_heads, dims.head_dim()));
+        let v = Array2::ones((dims.gqa_kv_heads, dims.head_dim()));
         cache.insert(&k, &v);
         assert_eq!(cache.len, 1);
         assert_eq!(cache.pos, 1);
@@ -345,20 +378,22 @@ mod tests {
 
     #[test]
     fn test_kv_cache_wrap() {
-        let mut cache = KVCache::new();
-        let k = Array2::ones((GQA_KV_HEADS, HEAD_DIM));
-        let v = Array2::ones((GQA_KV_HEADS, HEAD_DIM));
-        for _ in 0..GQA_WINDOW + 5 {
+        let dims = ModelDims::tiny();
+        let mut cache = tiny_cache();
+        let k = Array2::ones((dims.gqa_kv_heads, dims.head_dim()));
+        let v = Array2::ones((dims.gqa_kv_heads, dims.head_dim()));
+        for _ in 0..dims.gqa_window + 5 {
             cache.insert(&k, &v);
         }
-        assert_eq!(cache.len, GQA_WINDOW);
+        assert_eq!(cache.len, dims.gqa_window);
         assert_eq!(cache.pos, 5);
-        assert_eq!(cache.tokens_seen, (GQA_WINDOW + 5) as u64);
+        assert_eq!(cache.tokens_seen, (dims.gqa_window + 5) as u64);
     }
 
     #[test]
     fn test_rope_position_zero_identity() {
-        let mut q = Array2::ones((GQA_Q_HEADS, HEAD_DIM));
+        let dims = ModelDims::tiny();
+        let mut q = Array2::ones((dims.gqa_q_heads, dims.head_dim()));
         let baseline = q.clone();
         apply_rope(&mut q, 0);
         assert_eq!(q, baseline);
@@ -367,17 +402,24 @@ mod tests {
     #[test]
     fn test_gqa_residual() {
         // With zero weights, output = input (residual only)
-        let layer = GqaLayer::zeros(0);
-        let mut cache = KVCache::new();
+        let dims = ModelDims::tiny();
+        let layer = GqaLayer::zeros(
+            0,
+            dims.d_model,
+            dims.gqa_q_heads,
+            dims.gqa_kv_heads,
+            dims.head_dim(),
+        );
+        let mut cache = tiny_cache();
         // Insert a dummy entry so cache is non-empty
-        let k = Array2::zeros((GQA_KV_HEADS, HEAD_DIM));
-        let v = Array2::zeros((GQA_KV_HEADS, HEAD_DIM));
+        let k = Array2::zeros((dims.gqa_kv_heads, dims.head_dim()));
+        let v = Array2::zeros((dims.gqa_kv_heads, dims.head_dim()));
         cache.insert(&k, &v);
 
-        let h = Array1::from_vec(vec![1.0; D_MODEL]);
+        let h = Array1::from_vec(vec![1.0; dims.d_model]);
         let out = layer.forward_step(&h, &mut cache);
-        assert_eq!(out.len(), D_MODEL);
-        for i in 0..D_MODEL {
+        assert_eq!(out.len(), dims.d_model);
+        for i in 0..dims.d_model {
             assert!(
                 (out[i] - h[i]).abs() < 1e-4,
                 "Residual broken at {}: got {}",
@@ -404,8 +446,9 @@ mod tests {
 
     #[test]
     fn test_cache_size() {
-        let cache = KVCache::new();
-        let expected = 2 * GQA_WINDOW * GQA_KV_HEADS * HEAD_DIM * 4;
+        let dims = ModelDims::tiny();
+        let cache = tiny_cache();
+        let expected = 2 * dims.gqa_window * dims.gqa_kv_heads * dims.head_dim() * 4;
         assert_eq!(cache.size_bytes(), expected);
     }
 }

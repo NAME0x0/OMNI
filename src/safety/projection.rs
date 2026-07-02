@@ -3,9 +3,14 @@
 //! Projects any point x ∈ R^d onto the intersection of convex sets
 //! (halfspaces + approximate convex hull) using Dykstra's algorithm.
 //!
-//! Key property: THIS IS NON-DIFFERENTIABLE.
-//! No gradient flows through the projection, making it immune to
-//! gradient-based adversarial attacks. The safety boundary is a hard wall.
+//! Security note: this projection guarantees OUTPUT MEMBERSHIP in the
+//! polytope — a hard geometric constraint that the returned point always
+//! satisfies every halfspace. It does NOT guarantee semantic safety, and it
+//! is NOT immune to attack: halfspace projection is piecewise-linear and
+//! differentiable almost everywhere, so gradient-based (e.g. BPDA-style)
+//! and gradient-free adversarial attacks both apply against whatever model
+//! sits upstream of it. At best, the projection raises attack difficulty by
+//! constraining the reachable output region; it is not a proof of safety.
 
 use ndarray::Array1;
 
@@ -34,7 +39,9 @@ pub struct ProjectionConfig {
 impl Default for ProjectionConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 50,
+            // Single source of truth for the default iteration budget lives
+            // in crate::config::SPP_ITERATIONS, so the two never drift.
+            max_iterations: crate::config::SPP_ITERATIONS,
             tolerance: 1e-6,
             priority_order: true,
             project_to_hull: true,
@@ -197,9 +204,33 @@ pub fn project_onto_polytope(
         if let Some((_, anchor_dist)) = polytope.anchors.nearest(&result.point) {
             // If far from nearest anchor, pull toward hull
             let blend_factor = (anchor_dist / 10.0).min(1.0) * 0.5;
-            result.point = &result.point * (1.0 - blend_factor) + &hull_proj * blend_factor;
+            let blended = &result.point * (1.0 - blend_factor) + &hull_proj * blend_factor;
+
+            // The hull blend is a convex combination and is NOT guaranteed to
+            // stay inside the halfspace intersection (the polytope is the
+            // intersection of the hull AND the halfspaces, not their union).
+            // If it leaves the feasible set, re-run Dykstra's projection on
+            // the blended point to restore the core invariant: the output
+            // must always satisfy every halfspace.
+            if polytope.halfspaces.is_feasible(&blended) {
+                result.point = blended;
+            } else {
+                let reprojected = dykstra_project(&blended, &polytope.halfspaces, config);
+                result.iterations += reprojected.iterations;
+                result.converged = reprojected.converged;
+                result.residual = reprojected.residual;
+                result.active_constraints = reprojected.active_constraints;
+                result.point = reprojected.point;
+            }
         }
     }
+
+    // distance_moved must always reflect total displacement from the
+    // original input point, regardless of which branch above ran.
+    result.distance_moved = {
+        let diff = &result.point - x;
+        diff.iter().map(|v| v * v).sum::<f32>().sqrt()
+    };
 
     result
 }
@@ -360,5 +391,58 @@ mod tests {
         let result = dykstra_project(&x, &set, &config);
         assert!(result.converged);
         assert!(result.distance_moved < 1e-10);
+    }
+
+    /// Regression test for the hull-blend feasibility bug: a single distant
+    /// anchor pulls the post-Dykstra point via convex-hull blending, and the
+    /// naive blend used to land outside the halfspace intersection. The
+    /// output of `project_onto_polytope` must always be feasible.
+    #[test]
+    fn test_blend_reprojection_preserves_feasibility() {
+        use super::super::anchors::{AnchorCategory, AnchorSet, SafetyAnchor};
+        use super::super::polytope::SafetyPolytope;
+
+        // Single halfspace: x <= 1
+        let mut halfspaces = HalfspaceSet::new();
+        halfspaces.add(Halfspace::new(
+            Array1::from_vec(vec![1.0, 0.0]),
+            1.0,
+            "x<=1",
+        ));
+
+        // A single anchor far outside the halfspace, so the hull projection
+        // pulls hard toward an infeasible point (naive blend would exit P).
+        let mut anchors = AnchorSet::new();
+        anchors.add(SafetyAnchor::new(
+            Array1::from_vec(vec![100.0, 0.0]),
+            "far",
+            AnchorCategory::Factual,
+        ));
+
+        let polytope = SafetyPolytope::new(anchors, halfspaces);
+
+        let config = ProjectionConfig {
+            max_iterations: 50,
+            tolerance: 1e-6,
+            priority_order: true,
+            project_to_hull: true,
+            hull_k: 1,
+        };
+
+        let x = Array1::from_vec(vec![5.0, 0.0]);
+        let result = project_onto_polytope(&x, &polytope, &config);
+
+        assert!(
+            polytope.halfspaces.is_feasible(&result.point),
+            "blended point escaped the halfspace polytope: {:?}",
+            result.point
+        );
+
+        // distance_moved must be measured from the original input point.
+        let expected_dist = {
+            let diff = &result.point - &x;
+            diff.iter().map(|v| v * v).sum::<f32>().sqrt()
+        };
+        assert!((result.distance_moved - expected_dist).abs() < 1e-5);
     }
 }

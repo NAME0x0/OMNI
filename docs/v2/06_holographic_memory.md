@@ -1,7 +1,7 @@
 # § 06 — Holographic Distributed Memory (HDM)
 
-> Encode knowledge as interference patterns.  Retrieve in O(1).
-> No index to maintain.  No vector database.  Just physics.
+> Encode knowledge as interference patterns.  Retrieve by bank lookup plus cleanup scan.
+> No graph index to maintain.  No vector database.  Just physics.
 
 ---
 
@@ -21,8 +21,8 @@ high-dimensional binary vectors.
 
 Core properties:
 - **O(1) storage:** adding a fact is one vector operation
-- **O(1) retrieval:** querying is one correlation operation  
-- **Self-organising:** no index structure to build or maintain
+- **Bounded retrieval path:** O(1) bank lookup plus a scan over entries in that bank
+- **Self-organising:** no graph index structure to build or maintain
 - **Graceful degradation:** capacity is soft — quality degrades smoothly
 - **CPU-friendly:** all operations are XOR + popcount (SIMD-native)
 
@@ -48,16 +48,21 @@ $$P\left[\text{cos\_sim}(a, b) > 0.1\right] < 10^{-10} \quad \text{for random } 
 
 | Operation | Symbol | Definition | Purpose |
 |-----------|--------|------------|---------|
-| **Binding** | $a \circledast b$ | Circular convolution (or XOR for binary) | Create association between two concepts |
-| **Bundling** | $a + b$ | Element-wise majority vote (or thresholded sum) | Superimpose multiple items into one vector |
-| **Similarity** | $\delta(a, b)$ | Hamming distance (or normalised dot product) | Check if two vectors are related |
+| **Binding** | $a \oplus b$ | XOR over 10,000-bit binary hypervectors | Create association between two concepts |
+| **Bundling** | $a + b$ | Element-wise majority vote | Superimpose multiple items into one vector |
+| **Similarity** | $\delta(a, b)$ | Hamming distance | Check if two vectors are related |
+
+The implemented scheme in `src/memory/hdm.rs` is binary sparse distributed
+memory / BSC-style: XOR binding, majority-vote bundling, and nearest-Hamming
+cleanup.  Circular convolution is the real-valued HRR analogue from Plate
+(2003), included here as related work rather than the implementation.
 
 ### 2.3  Key Properties
 
-1. **Binding is invertible:** $a \circledast b \circledast b^{-1} \approx a$
-   (where $b^{-1}$ is the "unbound" of $b$: bit-reversal for binary vectors)
+1. **Binding is invertible:** $a \oplus b \oplus b = a$
+   (XOR is its own inverse for binary hypervectors)
 2. **Bundling preserves components:** $\delta(a + b, a) > \text{threshold}$
-3. **Binding distributes over bundling:** $a \circledast (b + c) = (a \circledast b) + (a \circledast c)$
+3. **Binding distributes over bundling:** $a \oplus (b + c) = (a \oplus b) + (a \oplus c)$
 
 ---
 
@@ -69,7 +74,7 @@ HDM organises memory into **2,000 banks**, each holding a superposition
 of bound associations:
 
 ```
-Bank_k = Σᵢ (key_vector_i ⊛ value_vector_i)   for all facts in bank k
+Bank_k = majorityᵢ(key_vector_i XOR value_vector_i)   for all facts in bank k
 ```
 
 Each bank is a single 10,000-bit vector (1.25 KB).  
@@ -140,7 +145,7 @@ Input: key_embedding ∈ R^4096, value_text: &str
 6. entries.push(MemoryEntry { ... })                 // store metadata
 ```
 
-**Cost:** 3 × 10,000 bit-ops + hash = ~0.01 ms
+**Projected cost:** 3 × 10,000 bit-ops + hash = ~0.01 ms
 
 ### 4.2  Retrieve (Query a Fact)
 
@@ -150,13 +155,14 @@ Input: query_embedding ∈ R^4096
 1. query_hv = codebook.encode(query_embedding)      // → {0,1}^10000
 2. bank_id = hash(query_hv) mod 2000                 // same hash
 3. unbound = banks[bank_id] XOR query_hv             // unbind query
-4. // unbound ≈ value_hv if (query ⊛ value) was bundled in this bank
-5. candidates = entries.filter(e => e.bank_id == bank_id)
+4. // unbound ≈ value_hv if (query XOR value) was bundled in this bank
+5. candidates = entries.filter(e => e.bank_id == bank_id)  // O(entries in bank)
 6. best = argmin_{c ∈ candidates} hamming(unbound, c.value_hv)
 7. return entries[best].value_text
 ```
 
-**Cost:** XOR + popcount over ~25 candidates = ~0.03 ms
+**Cost:** XOR + popcount over the entries in one bank.  The ~0.03 ms figure is
+a projection; no comparative benchmark against HNSW exists in this repo.
 
 ### 4.3  Multi-Bank Retrieval
 
@@ -171,7 +177,7 @@ If the fact might be in multiple banks (fuzzy key):
 6. return entry with global best score
 ```
 
-**Cost:** 5 × (XOR + popcount scan) = ~0.15 ms
+**Projected cost:** 5 × (XOR + popcount scan) = ~0.15 ms
 
 ---
 
@@ -179,35 +185,57 @@ If the fact might be in multiple banks (fuzzy key):
 
 ### 5.1  Per-Bank Capacity
 
-A 10,000-bit bank can hold $\sim \sqrt{D}$ associations before
-interference degrades retrieval below 90% accuracy:
+The old $\sqrt{D}$ heuristic for a 10,000-bit bank gives about 100
+associations, but the measured closed-set cleanup curve is less pessimistic
+for this implementation.  With XOR binding, one-shot majority-vote bundling,
+and nearest-Hamming cleanup among the bank's own stored values, the observed
+knee is between 200 and 500 associations per bank.
 
 $$
-C_{\text{bank}} \approx \sqrt{10000} \approx 100 \text{ associations}
+C_{\text{bank, practical}} \approx 200 \text{ associations at } \geq 99\%
 $$
 
-With 2,000 banks: total capacity ≈ **200,000 associations** at ≥90% accuracy.
+With 2,000 banks: total measured closed-set capacity is about **400,000
+associations** at ≥99% accuracy.
+
+Important caveat: this is **closed-set retrieval**.  The query key is known to
+be stored, and cleanup candidates are limited to that bank's own entries.
+Open-set retrieval, where HDM must detect that a fact is not stored, requires
+a distance threshold and will have lower effective capacity.  That threshold
+curve is unmeasured future work.
 
 ### 5.2  Graceful Degradation
 
-| Associations per bank | Retrieval accuracy |
-|----------------------|-------------------|
-| 10 | 99.9% |
-| 25 | 99.2% |
-| 50 | 97.1% |
-| 100 | 90.0% |
-| 200 | 75.0% |
-| 500 | 50.0% |
+Measured by `examples/hdm_capacity.rs` using 10,000-bit vectors, XOR binding,
+one-shot majority-vote bundling, closed-set nearest-Hamming retrieval among
+the bank's own stored values, 8 banks per load, and seeded splitmix64
+randomness:
 
-Above capacity, the bank becomes "noisy" — retrieval still works but
-requires more candidate checking.
+| N per bank | measured accuracy | stddev |
+|-----------:|-------------------:|-------:|
+| 10 | 100.0% | 0.00% |
+| 25 | 100.0% | 0.00% |
+| 50 | 100.0% | 0.00% |
+| 100 | 100.0% | 0.00% |
+| 200 | 99.8% | 0.24% |
+| 500 | 67.2% | 2.16% |
+| 1000 | 26.1% | 2.24% |
+| 2000 | 5.9% | 0.59% |
+| 5000 | 0.7% | 0.54% |
+| 10000 | 0.1% | 0.14% |
+| 20000 | 0.0% | 0.00% |
+
+These numbers were obtained after fixing a PRNG defect in
+`HyperVector::random`: raw xorshift without seed avalanche produced
+correlated vectors from sequential seeds.  The current splitmix64-mixed
+generator restores the approximate orthogonality assumption required by HDM.
 
 ### 5.3  Scaling to 500K+ Entries
 
 For larger knowledge bases, HDM uses **hierarchical banks on NVMe**:
 
 ```
-Level 0 (RAM):   2,000 banks → 200K entries, 13 MB
+Level 0 (RAM):   2,000 banks → ~400K entries at ≥99% closed-set accuracy, 2.5 MB bank index (+ metadata)
 Level 1 (NVMe):  20,000 banks → 2M entries, 130 MB
 Level 2 (NVMe):  200,000 banks → 20M entries, 1.3 GB
 ```
@@ -253,15 +281,18 @@ are known*.  When HDM retrieves a fact:
 
 | Feature | RAG + HNSW | MemoryBank | **HDM (ours)** |
 |---------|-----------|-----------|----------------|
-| Index structure | Graph (O(log n)) | Flat scan | **None (O(1))** |
+| Index structure | Graph (O(log n)) | Flat scan | **Hash-bucketed; O(1) bank lookup + O(bank entries) candidate scan** |
 | Insert time | O(log n) + rebuild | O(1) | **O(1)** |
-| Retrieval time | 0.5-2 ms | 1-5 ms | **0.03 ms** |
+| Retrieval time | 0.5-2 ms | 1-5 ms | **Projected ~0.03 ms; unbenchmarked vs HNSW** |
 | Memory overhead | Index = 2-5× data | Minimal | **1.25 KB/bank** |
 | Maintenance | Periodic re-index | None | **None** |
 | Persistence | External DB | In-memory | **Binary file** |
 | Capacity scaling | ∞ (disk) | RAM-limited | **Hierarchical** |
 | Hardware | GPU-accelerated | CPU | **CPU (SIMD)** |
 | Interpretability | Nearest-neighbour | Exact match | **Distributed** |
+
+No comparative benchmark against HNSW exists in this repo; HDM timing claims
+above are projections from bit-operation cost and per-bank candidate counts.
 
 ---
 

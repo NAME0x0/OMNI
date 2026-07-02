@@ -4,12 +4,11 @@
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{
-    self, D_MODEL, FFN_INTERMEDIATE, N_GQA_LAYERS, N_LAYERS, N_PDR_LAYERS, VOCAB_SIZE,
-};
+use crate::config;
 use crate::core::pdr::PdrLayer;
 use crate::core::pdr_state::PdrStateBank;
 use crate::core::windowed_gqa::{GqaLayer, KVCacheBank};
+use crate::core::ModelDims;
 
 /// SwiGLU Feed-Forward Network weights (shared/non-expert layers use this directly;
 /// expert layers use the ternary-packed variant via the execution module).
@@ -29,12 +28,13 @@ pub struct FfnWeights {
 }
 
 impl FfnWeights {
-    pub fn zeros() -> Self {
+    /// Create zero-initialised weights for the given `d_model`/`ffn_intermediate`.
+    pub fn zeros(d_model: usize, ffn_intermediate: usize) -> Self {
         Self {
-            w_gate: Array2::zeros((FFN_INTERMEDIATE, D_MODEL)),
-            w_up: Array2::zeros((FFN_INTERMEDIATE, D_MODEL)),
-            w_down: Array2::zeros((D_MODEL, FFN_INTERMEDIATE)),
-            rms_scale: Array1::ones(D_MODEL),
+            w_gate: Array2::zeros((ffn_intermediate, d_model)),
+            w_up: Array2::zeros((ffn_intermediate, d_model)),
+            w_down: Array2::zeros((d_model, ffn_intermediate)),
+            rms_scale: Array1::ones(d_model),
         }
     }
 
@@ -48,7 +48,7 @@ impl FfnWeights {
     }
 
     pub fn param_count(&self) -> usize {
-        2 * FFN_INTERMEDIATE * D_MODEL + D_MODEL * FFN_INTERMEDIATE + D_MODEL
+        self.w_gate.len() + self.w_up.len() + self.w_down.len() + self.rms_scale.len()
     }
 }
 
@@ -60,9 +60,11 @@ pub struct Embedding {
 }
 
 impl Embedding {
-    pub fn zeros() -> Self {
+    /// Create a zero-initialised embedding table for the given
+    /// `vocab_size`/`d_model`.
+    pub fn zeros(vocab_size: usize, d_model: usize) -> Self {
         Self {
-            weight: Array2::zeros((VOCAB_SIZE, D_MODEL)),
+            weight: Array2::zeros((vocab_size, d_model)),
         }
     }
 
@@ -99,36 +101,47 @@ pub struct PerspectiveModel {
 }
 
 impl PerspectiveModel {
-    /// Create an uninitialised model (zero weights).
-    pub fn zeros() -> Self {
-        let mut layers = Vec::with_capacity(N_LAYERS);
-        let mut shared_ffn = Vec::with_capacity(N_LAYERS);
+    /// Create an uninitialised model (zero weights) sized per `dims`.
+    pub fn zeros(dims: &ModelDims) -> Self {
+        let n_layers = dims.n_layers();
+        let mut layers = Vec::with_capacity(n_layers);
+        let mut shared_ffn = Vec::with_capacity(n_layers);
         let mut pdr_idx = 0;
         let mut gqa_idx = 0;
 
-        for layer in 0..N_LAYERS {
+        for layer in 0..n_layers {
             if config::is_pdr_layer(layer) {
-                layers.push(LayerKind::Pdr(PdrLayer::zeros(pdr_idx)));
+                layers.push(LayerKind::Pdr(PdrLayer::zeros(
+                    pdr_idx,
+                    dims.d_model,
+                    dims.pdr_rank,
+                )));
                 pdr_idx += 1;
             } else {
-                layers.push(LayerKind::Gqa(GqaLayer::zeros(gqa_idx)));
+                layers.push(LayerKind::Gqa(GqaLayer::zeros(
+                    gqa_idx,
+                    dims.d_model,
+                    dims.gqa_q_heads,
+                    dims.gqa_kv_heads,
+                    dims.head_dim(),
+                )));
                 gqa_idx += 1;
             }
-            shared_ffn.push(FfnWeights::zeros());
+            shared_ffn.push(FfnWeights::zeros(dims.d_model, dims.ffn_intermediate));
         }
 
-        assert_eq!(pdr_idx, N_PDR_LAYERS);
-        assert_eq!(gqa_idx, N_GQA_LAYERS);
+        assert_eq!(pdr_idx, dims.n_pdr_layers);
+        assert_eq!(gqa_idx, dims.n_gqa_layers);
 
         Self {
-            embedding: Embedding::zeros(),
+            embedding: Embedding::zeros(dims.vocab_size, dims.d_model),
             layers,
             shared_ffn,
-            final_norm_scale: Array1::ones(D_MODEL),
+            final_norm_scale: Array1::ones(dims.d_model),
         }
     }
 
-    /// Single-token forward pass through all 80 layers.
+    /// Single-token forward pass through all layers.
     ///
     /// This is the core inference path.  Expert loading is handled externally
     /// by the runtime pipeline — this function accepts an optional expert FFN
@@ -178,7 +191,7 @@ impl PerspectiveModel {
 
     /// Total shared parameter count (excluding experts).
     pub fn shared_param_count(&self) -> usize {
-        let embed = VOCAB_SIZE * D_MODEL;
+        let embed = self.embedding.weight.len();
         let layer_params: usize = self
             .layers
             .iter()
@@ -188,7 +201,7 @@ impl PerspectiveModel {
             })
             .sum();
         let ffn_params: usize = self.shared_ffn.iter().map(|f| f.param_count()).sum();
-        let final_norm = D_MODEL;
+        let final_norm = self.final_norm_scale.len();
         embed + layer_params + ffn_params + final_norm
     }
 }
@@ -210,18 +223,18 @@ fn silu(x: f32) -> f32 {
 mod tests {
     use super::*;
 
-    use crate::config::{N_GQA_LAYERS, N_PDR_LAYERS};
-
     #[test]
     fn test_model_layer_count() {
-        let model = PerspectiveModel::zeros();
-        assert_eq!(model.layers.len(), N_LAYERS);
-        assert_eq!(model.shared_ffn.len(), N_LAYERS);
+        let dims = ModelDims::tiny();
+        let model = PerspectiveModel::zeros(&dims);
+        assert_eq!(model.layers.len(), dims.n_layers());
+        assert_eq!(model.shared_ffn.len(), dims.n_layers());
     }
 
     #[test]
     fn test_model_layer_types() {
-        let model = PerspectiveModel::zeros();
+        let dims = ModelDims::tiny();
+        let model = PerspectiveModel::zeros(&dims);
         let pdr_count = model
             .layers
             .iter()
@@ -232,21 +245,23 @@ mod tests {
             .iter()
             .filter(|l| matches!(l, LayerKind::Gqa(_)))
             .count();
-        assert_eq!(pdr_count, N_PDR_LAYERS);
-        assert_eq!(gqa_count, N_GQA_LAYERS);
+        assert_eq!(pdr_count, dims.n_pdr_layers);
+        assert_eq!(gqa_count, dims.n_gqa_layers);
     }
 
     #[test]
     fn test_embedding() {
-        let emb = Embedding::zeros();
+        let dims = ModelDims::tiny();
+        let emb = Embedding::zeros(dims.vocab_size, dims.d_model);
         let h = emb.embed(0);
-        assert_eq!(h.len(), D_MODEL);
+        assert_eq!(h.len(), dims.d_model);
     }
 
     #[test]
     fn test_ffn_zeros_passthrough() {
-        let ffn = FfnWeights::zeros();
-        let h = Array1::from_vec(vec![1.0; D_MODEL]);
+        let dims = ModelDims::tiny();
+        let ffn = FfnWeights::zeros(dims.d_model, dims.ffn_intermediate);
+        let h = Array1::from_vec(vec![1.0; dims.d_model]);
         let out = ffn.forward(&h);
         // With zero weights, SwiGLU output should be zero
         for &v in out.iter() {

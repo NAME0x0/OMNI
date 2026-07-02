@@ -1,7 +1,17 @@
 # § 05 — Layer-Streamed Ternary Execution
 
 > No multiplication needed.  Each weight is add, subtract, or skip.
-> Stream one layer at a time.  The GPU never waits.
+> Stream one layer at a time.  The target GPU path is designed to avoid stalls.
+
+---
+
+## Implementation Status
+
+Only CPU ternary kernels currently exist in `src/kernels/ternary_gemm_cpu.rs`.
+`src/kernels/kernel_dispatch.rs` contains CUDA / HIP / SYCL feature-gated
+stubs with TODOs that always fall back to CPU.  The GPU kernels and async DMA
+pipeline described below are design targets, not implemented or benchmarked
+end-to-end in this repository.
 
 ---
 
@@ -11,19 +21,24 @@
 
 Every expert parameter is one of three values: $\{-1, 0, +1\}$.
 
-This is **not post-hoc quantisation** of a float model.  The weights are
-trained natively in this format using Straight-Through Estimators (STE)
-during back-propagation, following the BitNet b1.58 methodology:
+This is **not post-hoc quantisation** of a float model.  The intended training
+path trains weights natively in this format using Straight-Through Estimators
+(STE) during back-propagation, following the BitNet b1.58 methodology:
 
 ```
 Forward pass:  w_ternary = sign(w_latent) * round(|w_latent|)  ∈ {-1, 0, +1}
 Backward pass: ∂L/∂w_latent = ∂L/∂w_ternary  (straight-through)
 ```
 
+BitNet b1.58 results cited for this design are from dense models at
+<=3.9B scale; they are unvalidated for an 8B-expert sparse MoE at this
+scale.
+
 ### 1.2  Information Content
 
 Each ternary value carries $\log_2(3) = 1.585$ bits of information.
-Packing: 5 trits fit in 8 bits ($3^5 = 243 \leq 256$).
+The implemented storage format packs 5 trits per byte
+($3^5 = 243 \leq 256$), which is 1.6 bits/param = 0.2 bytes/param.
 
 | Precision | Bits/param | 1B params | 8.12B params (1 expert) |
 |-----------|-----------|-----------|------------------------|
@@ -31,7 +46,8 @@ Packing: 5 trits fit in 8 bits ($3^5 = 243 \leq 256$).
 | INT8 | 8.0 | 1.00 GB | 8.12 GB |
 | 4-bit | 4.0 | 0.50 GB | 4.06 GB |
 | 2-bit | 2.0 | 0.25 GB | 2.03 GB |
-| **Ternary** | **1.585** | **0.198 GB** | **1.604 GB** |
+| **Ternary (information)** | **1.585** | **0.198 GB** | **1.609 GB** |
+| **Ternary (packed storage)** | **1.6** | **0.200 GB** | **1.624 GB** |
 | 1-bit binary | 1.0 | 0.125 GB | 1.015 GB |
 
 Ternary is 10× denser than FP16 and 2.5× denser than 4-bit quantisation,
@@ -69,10 +85,10 @@ Each weight contributes an addition, a subtraction, or nothing (if zero).
 Since ~50% of ternary weights are zero after training, we only process
 half the entries — plus each operation is an add/sub instead of a multiply.
 
-### 2.2  CUDA Kernel (Primary Target)
+### 2.2  Planned CUDA Kernel (Primary Target)
 
 ```cuda
-// Pseudocode — full kernel in src/kernels/ternary_gemm_cuda.cu
+// Pseudocode — planned kernel design, not currently implemented
 __global__ void ternary_matvec(
     const uint8_t* __restrict__ W_packed,  // packed ternary weights
     const half* __restrict__ x,            // input vector (FP16)
@@ -113,7 +129,7 @@ __global__ void ternary_matvec(
 }
 ```
 
-### 2.3  Performance Model
+### 2.3  Projected Performance Model
 
 For a SwiGLU FFN layer (gate + up projection: 4096 → 11008, down: 11008 → 4096):
 
@@ -123,9 +139,9 @@ For a SwiGLU FFN layer (gate + up projection: 4096 → 11008, down: 11008 → 40
 | Effective ops (50% zero) | 135.3 M | ~67.6 M add/sub |
 | Memory accessed (weights) | 270.5 MB | 27.1 MB |
 | Arithmetic intensity | ~0.5 FLOP/byte | ~2.5 op/byte |
-| Estimated GPU time (RTX 3060) | 8.1 ms | **0.14 ms** |
+| Target GPU time (RTX 3060) | 8.1 ms | **0.14 ms** |
 
-The 58× speedup comes from:
+The projected 58× speedup comes from:
 - 10× less data movement (ternary packing)
 - ~2× less compute (zero skipping)
 - ~3× per-op savings (add vs FMA)
@@ -134,12 +150,13 @@ The 58× speedup comes from:
 
 | Backend | File | Status | Notes |
 |---------|------|--------|-------|
-| CUDA (NVIDIA) | `ternary_gemm_cuda.cu` | Primary | Uses warp shuffles, shared memory tiling |
-| HIP (AMD) | `ternary_gemm_hip.cpp` | Ported | Near-identical to CUDA via HIP compatibility |
-| SYCL (Intel) | `ternary_gemm_sycl.cpp` | Planned | For Intel Arc / Data Center GPUs |
-| CPU (fallback) | `ternary_gemm_cpu.c` | Reference | AVX2/AVX-512 SIMD, no GPU required |
+| CUDA (NVIDIA) | `ternary_gemm_cuda.cu` | Design target | Would use warp shuffles, shared memory tiling |
+| HIP (AMD) | `ternary_gemm_hip.cpp` | Design target | Would mirror CUDA via HIP compatibility |
+| SYCL (Intel) | `ternary_gemm_sycl.cpp` | Design target | For Intel Arc / Data Center GPUs |
+| CPU (fallback) | `src/kernels/ternary_gemm_cpu.rs` | Implemented reference | Pure Rust packed/parallel matvec, no GPU required |
 
-All backends expose the same FFI interface via `kernel_dispatch.rs`.
+`kernel_dispatch.rs` exposes the intended backend selection surface, but the
+GPU backend branches are stubs and currently dispatch back to CPU.
 
 ---
 
@@ -172,14 +189,14 @@ Two VRAM buffers (A and B), each 27 MB:
 Stage 1: DMA Transfer (RAM → VRAM)
   - Source: hot expert cache in RAM (pinned memory)
   - Size: 27 MB (full) or 2.7 MB (delta)
-  - Time: 3.86 ms (full) / 0.39 ms (delta) @ 7 GB/s sustained
-  - Uses CUDA async memcpy on dedicated DMA stream
+  - Projected time: 3.86 ms (full) / 0.39 ms (delta) @ 7 GB/s sustained
+  - Planned GPU path would use CUDA async memcpy on dedicated DMA stream
 
-Stage 2: Trit Unpacking (GPU kernel)
+Stage 2: Trit Unpacking (planned GPU kernel)
   - Expand 5-trits-per-byte to FP16 lookup
   - Input: 27 MB packed → output: 270 MB FP16 in scratch
-  - Actually: we DON'T fully unpack. The ternary GEMM kernel
-    reads packed trits directly and accumulates in FP32.
+  - Actually: we DON'T fully unpack. The planned ternary GEMM kernel
+    would read packed trits directly and accumulate in FP32.
   - Unpack time: 0 ms (fused with GEMM)
 
 Stage 3: SwiGLU Computation (ternary GEMM)
@@ -187,7 +204,7 @@ Stage 3: SwiGLU Computation (ternary GEMM)
   - up   = TernaryMV(W_up, h)            →  11008 elements
   - out  = gate ⊙ up                    →  11008 elements
   - down = TernaryMV(W_down, out)        →  4096 elements
-  - Time: ~0.14 ms (add/sub only, 50% sparsity)
+  - Target time: ~0.14 ms (add/sub only, 50% sparsity)
 
 Stage 4: Residual Add
   - x += down
@@ -222,7 +239,7 @@ When a cold expert is needed (not in the hot-8 cache):
 ### 4.1  Load Pipeline
 
 ```
-1. NVMe read:  1.604 GB at 6 GB/s = 267 ms
+1. NVMe read:  1.624 GB at 6 GB/s = 271 ms
 2. Decompress: ternary data is already in packed format (no decompression)
 3. Pin memory:  Register the RAM buffer for DMA access
 4. Evict LRU:   Free the least-recently-used hot expert from RAM
@@ -241,7 +258,7 @@ At layer 30:
 ```
 
 This gives the NVMe ~35 ms to start fetching (while the GPU processes
-layers 31–60), potentially hiding most of the 267 ms load time for
+layers 31–60), potentially hiding part of the projected 271 ms load time for
 the least popular experts.
 
 ### 4.3  Expert Usage Statistics
@@ -258,7 +275,7 @@ per-token).
 
 ## 5  Ternary Sparsity Patterns
 
-### 5.1  Expected Distribution After Training
+### 5.1  Target Distribution After Training
 
 Based on BitNet b1.58 results scaled to our architecture:
 
@@ -285,9 +302,9 @@ optimisations (check if a column is all-zero before processing).
 
 ### 6.1  Accumulation
 
-All ternary GEMM kernels accumulate in **FP32** and cast to FP16 only at
-the final output.  This prevents catastrophic cancellation from the
-large number of additions/subtractions.
+The implemented CPU kernel and planned GPU kernels accumulate in **FP32** and
+cast to FP16 only at the final output.  This prevents catastrophic
+cancellation from the large number of additions/subtractions.
 
 ### 6.2  Non-Ternary Components
 
@@ -321,10 +338,10 @@ large number of additions/subtractions.
 
 ### 7.2  CPU-Only Mode
 
-The CPU kernel (`ternary_gemm_cpu.c`) enables running without any GPU:
+The CPU kernel (`src/kernels/ternary_gemm_cpu.rs`) enables running without any GPU:
 - Expert layers computed on CPU using AVX2/AVX-512
 - All 32 GB RAM available for expert caching (no VRAM split)
-- Expected throughput: ~1-2 tok/s (CPU-bound)
+- Target throughput: ~1-2 tok/s (CPU-bound, unbenchmarked end-to-end)
 - Useful for testing, CI, and GPU-less servers
 
 ---

@@ -2,10 +2,11 @@
 
 > **Perspective Is All You Need**
 >
-> A 1.05 T-parameter sparse Mixture-of-Experts language model that runs
-> entirely on **4 GB VRAM + 32 GB RAM** through seven interlocking novel
-> subsystems.  Every component is designed from first principles to solve
-> a specific class of failures in current large language models.
+> A 1.05 T-parameter sparse Mixture-of-Experts language model designed to
+> run entirely on **4 GB VRAM + 32 GB RAM** through seven interlocking novel
+> subsystems (design target; no end-to-end runtime exists yet).  Every
+> component is designed from first principles to solve a specific class of
+> failures in current large language models.
 
 ---
 
@@ -29,8 +30,9 @@
 
 4. **Memory is holographic.**
    Holographic Distributed Memory (HDM) encodes associations in 10 000-bit
-   binary vectors via circular convolution.  O(1) retrieval, zero index
-   maintenance, 20× faster than HNSW.
+   binary vectors via XOR binding and majority-vote bundling.  Constant-time
+   bank lookup plus a bounded candidate scan; no graph index to maintain.
+   (Comparative benchmarks vs HNSW: future work.)
 
 5. **Calibration is structural.**
    Multi-Perspective Decoding (MPD) generates candidate tokens from four
@@ -44,8 +46,9 @@
 
 7. **Safety is a hard geometric bound.**
    Safety Polytope Projection (SPP) constrains every output embedding to a
-   convex polytope of vetted safe outputs.  Non-differentiable → immune to
-   gradient-based adversarial attacks.
+   convex polytope of vetted safe outputs.  Hard geometric constraint:
+   outputs always lie inside the polytope.  Guarantees membership, not
+   semantic safety; raises (does not eliminate) attack difficulty.
 
 ---
 
@@ -65,8 +68,24 @@
 | Vocabulary | 32 768 (BPE) |
 | VRAM budget | 2 348 MB used / 4 096 MB (42.7 % slack) |
 | RAM budget | ~26 GB used / 32 GB (6.6 GB headroom) |
-| NVMe footprint | ~205 GB (all 128 experts, ternary-packed) |
-| Decode throughput | 12–14 tok/s (PCIe-bound pipeline) |
+| NVMe footprint | ~208 GB experts (+ ~40 GB deltas), packed at 1.6 bits/param |
+| Decode throughput | ~10–11 tok/s (projected from §02 PCIe model; unmeasured) |
+
+## Implementation Status
+
+| Component | Status |
+|---|---|
+| PDR | CPU reference implemented; parallel scan not implemented (sequential fallback) |
+| Manifold routing | Implemented (CPU + optional native path). Measured at init: Gini 0.062–0.069, all 128 experts reached over 10K random tokens (`examples/routing_balance.rs`) |
+| Ternary execution | CPU pack/GEMM implemented; GPU kernels NOT implemented (dispatch stubs fall back to CPU) |
+| HDM | Core primitives implemented; per-bank capacity measured (`examples/hdm_capacity.rs`) |
+| MPD | Prototype implemented |
+| FMEA | Prototype implemented |
+| SPP | Implemented; projection preserves halfspace feasibility |
+| Inference pipeline | NOT functional — `process_token` intentionally returns an error |
+| Training stack / tokenizer | Not implemented |
+
+Full test suite: 243 tests passing.
 
 ---
 
@@ -78,15 +97,16 @@
 | 02 | [Hardware Budgets](02_budgets_v2.md) | VRAM / RAM / NVMe / PCIe byte-level accounting |
 | 03 | [Perspective Decay Recurrence](03_perspective_decay.md) | PDR equations, complexity, state management |
 | 04 | [Manifold Routing](04_manifold_routing.md) | Torus geometry, expert placement, delta streaming |
-| 05 | [Ternary Execution](05_ternary_execution.md) | Native ternary format, CUDA / HIP / SYCL / CPU kernels |
+| 05 | [Ternary Execution](05_ternary_execution.md) | Native ternary format; CPU kernels implemented, GPU kernels planned |
 | 06 | [Holographic Memory](06_holographic_memory.md) | HDM binding, retrieval, capacity analysis |
-| 07 | [Multi-Perspective Decoding](07_multi_perspective.md) | MPD agreement protocol, calibration proof |
+| 07 | [Multi-Perspective Decoding](07_multi_perspective.md) | MPD agreement protocol, calibration hypothesis |
 | 08 | [Forward Adaptation](08_forward_adaptation.md) | FMEA JVP equations, evolutionary routing |
 | 09 | [Safety Polytope](09_safety_polytope.md) | SPP anchor construction, half-space projection |
 | 10 | [Training Plan](10_training_plan.md) | Curriculum, ternary-aware optimiser, scaling law |
 | 11 | [Inference Pipeline](11_inference_pipeline.md) | Full per-token pipeline, latency budget |
 | 12 | [Validation](12_validation_v2.md) | Ablations, stress tests, benchmark targets |
 | 13 | [Issue Matrix](13_issue_matrix.md) | 25 LLM issues → component mapping |
+| 14 | [Future Extensions](14_extensions.md) | v1 subsystems retained as design candidates |
 
 ---
 
@@ -97,7 +117,7 @@ src/
 ├── core/           PDR, windowed GQA, model skeleton
 ├── routing/        Manifold router, delta streaming
 ├── execution/      Ternary packing, layer-streaming pipeline
-├── kernels/        CUDA / HIP / SYCL / CPU ternary GEMM
+├── kernels/        CPU ternary GEMM (GPU dispatch stubs, kernels planned)
 ├── memory/         Holographic Distributed Memory
 ├── decoding/       Multi-Perspective Decoding
 ├── learning/       Forward-Mode Evolutionary Adaptation
@@ -140,4 +160,4 @@ Input tokens
 
 ---
 
-*Last updated: 2026-02-20 — Perspective v2.0*
+*Last updated: 2026-07-02 — Perspective v2.0*

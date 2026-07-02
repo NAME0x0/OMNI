@@ -28,13 +28,27 @@ impl HyperVector {
     /// Create a random hypervector (each bit iid Bernoulli(0.5)).
     pub fn random(seed: u64) -> Self {
         let mut data = vec![0u8; HDM_BYTES];
-        // Simple xorshift64 PRNG for reproducibility
-        let mut state = seed ^ 0x5DEECE66D;
-        for byte in data.iter_mut() {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *byte = (state & 0xFF) as u8;
+        // splitmix64: full-avalanche seed mixing so that *sequential* seeds
+        // (0, 1, 2, …) still yield statistically independent vectors.
+        //
+        // The previous implementation fed `seed ^ const` straight into
+        // xorshift64, which has no avalanche on its seed: nearby seeds
+        // produced heavily correlated early bytes, silently violating the
+        // "random hypervectors are approximately orthogonal" property that
+        // all HDM capacity math depends on.
+        let mut state = seed.wrapping_add(0x9E3779B97F4A7C15);
+        let mut next = move || {
+            state = state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        };
+        for chunk in data.chunks_mut(8) {
+            let r = next().to_le_bytes();
+            for (b, v) in chunk.iter_mut().zip(r.iter()) {
+                *b = *v;
+            }
         }
         Self { data }
     }
@@ -200,6 +214,47 @@ pub fn majority_vote(vectors: &[&HyperVector]) -> HyperVector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Closed-set capacity smoke test: bundle N bound key/value pairs into a
+    /// single bank via `majority_vote`, unbind each key, and recover the value
+    /// by nearest-Hamming among the N stored values. Guards the property that
+    /// closed-set cleanup retrieval stays essentially perfect at moderate
+    /// per-bank load (see `examples/hdm_capacity.rs` for the full sweep).
+    #[test]
+    fn test_bank_closed_set_retrieval_at_moderate_load() {
+        let n = 50;
+        let keys: Vec<HyperVector> = (0..n).map(|i| HyperVector::random(1000 + i)).collect();
+        let values: Vec<HyperVector> = (0..n).map(|i| HyperVector::random(5000 + i)).collect();
+
+        let bound: Vec<HyperVector> = keys
+            .iter()
+            .zip(values.iter())
+            .map(|(k, v)| k.xor(v))
+            .collect();
+        let bound_refs: Vec<&HyperVector> = bound.iter().collect();
+        let bank = majority_vote(&bound_refs);
+
+        let mut correct = 0;
+        for i in 0..n as usize {
+            let probe = bank.xor(&keys[i]);
+            let best = values
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, v)| probe.hamming_distance(v))
+                .map(|(j, _)| j)
+                .unwrap();
+            if best == i {
+                correct += 1;
+            }
+        }
+        let accuracy = correct as f64 / n as f64;
+        assert!(
+            accuracy > 0.95,
+            "closed-set retrieval accuracy {} at N={} below expected",
+            accuracy,
+            n
+        );
+    }
 
     #[test]
     fn test_zeros() {

@@ -258,6 +258,45 @@ mod tests {
         assert!((point.z - 0.8).abs() < 1e-6);
     }
 
+    /// Coverage smoke test: with pseudo-random (untrained) router weights and
+    /// pseudo-random inputs, every expert must be reachable. Measured in full
+    /// in `examples/routing_balance.rs` (Gini ≈ 0.06–0.07 at init, 0 unreached
+    /// experts over 10K tokens); this is a reduced-size CI guard.
+    #[test]
+    fn test_all_experts_reachable_with_random_router() {
+        // Small deterministic LCG so the test needs no external RNG dep.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            // Map to roughly N(0,1) by averaging 4 uniforms (CLT approximation).
+            let mut acc = 0.0f32;
+            for _ in 0..4 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                acc += ((state >> 40) as f32 / (1u64 << 24) as f32) - 0.5;
+            }
+            acc * 1.732 // scale to unit-ish variance
+        };
+
+        let mut layer = LayerRouter::zeros();
+        layer.w_route = Array2::from_shape_fn((3, D_MODEL), |_| next());
+        layer.b_route = Array1::from_shape_fn(3, |_| next());
+        let manifold = ExpertManifold::default_grid();
+
+        let mut seen = vec![false; N_EXPERTS];
+        for _ in 0..20_000 {
+            let h = Array1::from_shape_fn(D_MODEL, |_| next());
+            let d = layer.route(&h, &manifold);
+            seen[d.expert_id] = true;
+        }
+
+        let unreached = seen.iter().filter(|&&s| !s).count();
+        assert_eq!(
+            unreached, 0,
+            "{} of {} experts never selected over 20K random tokens",
+            unreached, N_EXPERTS
+        );
+    }
+
     #[test]
     fn test_route_and_fold_mutates_selected_position_without_growth() {
         let mut router = ModelRouter::zeros();

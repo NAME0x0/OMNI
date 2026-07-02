@@ -10,11 +10,13 @@
 |----------|-----------|--------------|-------|
 | GPU VRAM | 4 096 MB | ≤ 2 684 MB | 34.5 % |
 | System RAM | 32 768 MB | ≤ 26 000 MB | 20.6 % |
-| NVMe | 512+ GB | ~205 GB | — |
-| PCIe bandwidth | 16 GB/s (Gen 4 ×16) | ~7 GB/s sustained | — |
+| NVMe | 512+ GB | ~253 GB | — |
+| PCIe bandwidth | ~31.5 GB/s theoretical (Gen 4 ×16) | ~7 GB/s sustained | — |
 
 Slack is intentional: memory allocators fragment, drivers reserve VRAM,
 and the OS can spike.  A 34 % VRAM margin prevents OOM under load.
+The ~7 GB/s PCIe target is a deliberately conservative, unmeasured design
+assumption: about 22 % of the Gen 4 ×16 theoretical bandwidth.
 
 ---
 
@@ -30,7 +32,7 @@ and the OS can spike.  A 34 % VRAM margin prevents OOM under load.
 | 4 | Embedding table (32K × 4096) | INT8 | 131 M | 131 | Tied with output head |
 | 5 | PDR recurrent state (S_t) ×60 | FP16 | — | 120 | 60 × (4096 × 256) × 2 bytes |
 | 6 | GQA KV-cache (512-window) ×20 | FP16 | — | 42 | 20 × 8 heads × 128 dim × 512 pos × 2 × 2B |
-| 7 | Expert layer double-buffer | 1.58-bit | 135.3 M | 54 | 2 × one expert-layer (~27 MB each) |
+| 7 | Expert layer double-buffer | 1.6-bit stored | 135.3 M | 54 | 2 × one expert-layer (~27 MB each) |
 | 8 | Ternary dequant scratch | FP16 | — | 100 | Unpacked expert layer for compute |
 | 9 | Activation scratch | FP16 | — | 128 | Intermediate activations, GEMM workspace |
 | 10 | RMSNorm scale vectors ×80 | FP16 | 0.66 M | 1.3 | 80 × 2 norms × 4096 × 2B |
@@ -69,7 +71,9 @@ At 2-bit: `52.44M × 60 × 0.25 bytes = 786.6 MB ≈ 788 MB` ✓
 - At 2-bit: 2705.4M × 0.25 = 676.4 MB ≈ 677 MB ✓
 
 **Expert double-buffer (item 7):**
-One expert-layer = 135.27M params at 1.58-bit = 135.27M × 0.1975 bytes = 26.72 MB ≈ 27 MB.
+One expert-layer = 135.27M params.  Ternary information content is ~1.58
+bits/param; the implemented packing format stores 5 trits/byte = 1.6
+bits/param = 0.2 bytes/param.  135.27M × 0.2 bytes = 27.05 MB ≈ 27 MB.
 Double-buffer = 2 × 27 = 54 MB ✓
 
 **PDR state (item 5):**
@@ -89,7 +93,7 @@ Per layer: 8 KV-heads × 128 dim × 512 positions × 2 (K+V) × 2 bytes = 2.097 
 | # | Component | GB | Notes |
 |---|-----------|-----|-------|
 | 1 | Operating system + drivers | 4.0 | Conservative for Windows 11 |
-| 2 | Hot expert cache (top-8) | 12.8 | 8 × 8.12B × 0.1975 B/param = 1.604 GB each |
+| 2 | Hot expert cache (top-8) | 13.0 | 8 × 8.12B × 0.2 B/param = 1.624 GB each |
 | 3 | Shared weights (host mirror) | 1.8 | Full copy of VRAM-resident weights for reload |
 | 4 | Holographic memory banks | 2.5 | 2000 banks × 1.25 KB superposition + metadata |
 | 5 | HDM text store | 2.5 | ~50K entries × avg 50 bytes + indices |
@@ -99,22 +103,23 @@ Per layer: 8 KV-heads × 128 dim × 512 positions × 2 (K+V) × 2 bytes = 2.097 
 | 9 | Router state + manifold | 0.05 | 128 expert coordinates + distance cache |
 | 10 | Application code + stack | 0.5 | Rust binary, thread stacks |
 | 11 | Miscellaneous / fragmentation | 1.3 | Allocator overhead, page tables |
-| | **TOTAL** | **~26.0** | |
-| | **Headroom** | **~6.8** | 20.7 % free |
+| | **TOTAL** | **~26.2** | |
+| | **Headroom** | **~6.6** | ~20 % free |
 
 ### 3.1  Hot Expert Selection
 
 The 8 hottest experts (by recent routing frequency) are pinned in RAM.
 When the router selects a hot expert, its layers stream directly from RAM
-to VRAM at PCIe speed (~16 GB/s theoretical, ~7 GB/s sustained).
+to VRAM at PCIe speed (~31.5 GB/s theoretical, ~7 GB/s sustained).
 
 When a cold expert is needed:
-1. Load from NVMe → RAM staging buffer (1.6 GB at ~6 GB/s = ~267 ms)
+1. Load from NVMe → RAM staging buffer (1.624 GB at ~6 GB/s = ~271 ms)
 2. Evict the least-recently-used hot expert
 3. Promote the new expert to hot cache
 4. Stream layers to VRAM as usual
 
-Expected cold-expert frequency: < 5 % of tokens (Zipf routing distribution).
+Assumption (unvalidated): cold-expert frequency < 5 % of tokens, depending
+on trained routing statistics that do not exist yet.
 
 ---
 
@@ -122,13 +127,14 @@ Expected cold-expert frequency: < 5 % of tokens (Zipf routing distribution).
 
 | Component | Size | Format |
 |-----------|------|--------|
-| 128 expert weight files | 205 GB | Ternary-packed (1.58 bit/param) |
+| 128 expert weight files | ~208 GB | Ternary-packed (1.6 bits/param stored; ~1.58 bits information) |
 | Expert delta files (manifold neighbours) | ~40 GB | Sparse diff format |
 | HDM overflow store | 5 GB | Binary vector + text |
 | Model metadata + config | < 1 MB | JSON / MessagePack |
-| **TOTAL** | **~250 GB** | |
+| **TOTAL** | **~253 GB** | |
 
-Each expert file: 8.12B params × 1.58 bits ÷ 8 = **1.604 GB**.
+Each expert file: 8.12B params × 0.2 bytes = **1.624 GB**.
+Across 128 experts: 128 × 1.624 GB = **~208 GB**.
 
 Delta files between manifold-adjacent experts: ~10 % of full expert size
 (most weights shared) = ~160 MB per pair.  128 experts × ~2 neighbours
@@ -144,7 +150,7 @@ each = ~256 delta files × 160 MB = ~40 GB.
 |----------|-----------|------|---------------|
 | Expert layer (full) | RAM → VRAM | 27 MB | 3.86 ms |
 | Expert layer (delta) | RAM → VRAM | 2.8 MB | 0.40 ms |
-| Expected (70% delta) | RAM → VRAM | ~10 MB avg | 1.43 ms |
+| Expected (70% delta; design assumption, unvalidated) | RAM → VRAM | ~10 MB avg | 1.43 ms |
 | × 60 expert layers | | | **85.7 ms** |
 | KV-cache update (GQA) | VRAM → VRAM | negligible | — |
 | Activation readback (for MPD) | VRAM → RAM | 32 KB | < 0.01 ms |
@@ -154,16 +160,16 @@ layer N.  Since compute (~0.14 ms) ≪ transfer (~1.43 ms), the pipeline is
 **PCIe-bound** and total time ≈ 60 × 1.43 ms = **85.7 ms** for expert layers.
 
 Add GQA + shared FFN compute (~20 × 0.35 ms = 7 ms) + embedding + output
-(~0.03 ms) = **~93 ms per token = ~10.8 tok/s**.
+(~0.03 ms) = projected **~93 ms per token = ~10.8 tok/s**.
 
-### 5.2  Best Case (fully cached, sequential expert reuse)
+### 5.2  Projected Best Case (fully cached, sequential expert reuse)
 
 If the same expert is reused for a layer (common in continued text):
 - Delta = 0 bytes → no transfer needed
 - Compute only: 0.14 ms per expert layer
 - Total: 60 × 0.14 + 7 = 15.4 ms → **65 tok/s** (GPU-bound)
 
-### 5.3  Worst Case (all cold misses, full loads)
+### 5.3  Projected Worst Case (all cold misses, full loads)
 
 - Full expert layer: 27 MB / 7 GB/s = 3.86 ms
 - 60 layers: 231.4 ms
@@ -179,7 +185,7 @@ from the PDR state at layer 30 (halfway point).
 
 | Component | Typical power | Role |
 |-----------|--------------|------|
-| GPU (e.g., RTX 3060 4GB) | 170 W | Ternary GEMM, attention, norms |
+| GPU (a 4 GB-class GPU, e.g., RTX 3050 4 GB or laptop-class) | 170 W | Ternary GEMM, attention, norms |
 | CPU (PCIe controller) | 20 W | DMA orchestration, HDM retrieval |
 | RAM (DDR4/5) | 5 W | Expert cache, weights mirror |
 | NVMe SSD | 7 W | Cold expert storage |
@@ -191,6 +197,9 @@ with a discrete GPU.
 ---
 
 ## 7  Scaling Considerations
+
+These figures are extrapolations for an unmeasured model, not benchmarked
+throughput numbers.
 
 | If you have… | Adjustment |
 |--------------|-----------|

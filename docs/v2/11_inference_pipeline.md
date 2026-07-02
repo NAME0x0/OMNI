@@ -6,7 +6,14 @@
 
 ## 1  Pipeline Overview
 
+**Implementation status:** This document describes the intended inference
+design.  The Rust runtime path is not functional end-to-end yet:
+`src/runtime/pipeline.rs::process_token` intentionally returns an error, and
+there is no tokenizer wired into the runtime.
+
 A single token generation pass through PERSPECTIVE involves:
+
+**Projected compute-only stage sketch (bandwidth model; unmeasured):**
 
 ```
 Input token
@@ -15,9 +22,9 @@ Input token
   ├─ 2. PDR layers ×60 (VRAM)               ≈ 1.80 ms
   │     └─ Expert routing + execution ×60    (overlapped with PDR)
   ├─ 3. GQA layers ×20 (VRAM)               ≈ 0.60 ms
-  │     └─ Expert routing + execution ×20    (overlapped with GQA)
+  │     └─ Windowed attention/shared compute
   ├─ 4. LM head (VRAM)                      ≈ 0.02 ms
-  ├─ 5. SPP safety projection (VRAM)        ≈ 0.01 ms
+  ├─ 5. SPP safety projection (CPU ref; device TBD) ≈ 0.01 ms
   ├─ 6. MPD (conditional, 20% of tokens)    ≈ 3.20 ms (amortised 0.64 ms)
   ├─ 7. HDM retrieval (conditional, 5%)     ≈ 0.03 ms (amortised ~0 ms)
   └─ 8. Sample + output                     ≈ 0.01 ms
@@ -26,8 +33,9 @@ Input token
                                     ~3.74 ms/token (with MPD amortised)
 ```
 
-This yields **~322 tok/s compute-bound** — but PCIe bandwidth is the real
-bottleneck.
+This compute-only sketch yields **~322 tok/s compute-bound** in isolation,
+but it is not the headline throughput.  The projected PCIe-bound baseline from
+the § 02 bandwidth model is **~93 ms/token, ~10.8 tok/s**.
 
 ---
 
@@ -35,21 +43,22 @@ bottleneck.
 
 ### 2.1  Per-Layer Expert Load
 
-Each of the 80 layers requires loading one expert (top-1 routing):
+Each of the 60 expert layers requires loading one expert-layer (top-1 routing):
 
 | Metric | Full load | Delta load | Unit |
 |--------|-----------|------------|------|
 | Expert size (ternary packed) | 27 MB | 2.7 MB | per expert |
-| PCIe 3.0 ×16 bandwidth | 12.4 GB/s | 12.4 GB/s | |
-| Full load time | 2.13 ms | 0.21 ms | per expert |
-| 80 layers (all full) | 170.4 ms | — | per token |
-| 80 layers (30% full, 70% delta) | — | **63.1 ms** | per token |
+| Sustained PCIe bandwidth assumption | 7 GB/s | 7 GB/s | unmeasured |
+| Full load time | 3.86 ms | 0.40 ms | per expert-layer |
+| 60 expert layers (all full) | 231.4 ms | — | per token |
+| 60 expert layers (30% full, 70% delta) | — | **85.7 ms** | per token |
 
-**Throughput bottleneck: 63.1 ms/token → ~15.8 tok/s** (PCIe bound).
+Add GQA + shared FFN compute (~7 ms) and embedding/output overhead:
+**projected bottleneck: ~93 ms/token → ~10.8 tok/s** (PCIe bound).
 
 ### 2.2  Mitigation: Layer-Streamed Double Buffering
 
-We don't wait for all 80 experts to load.  Instead, the pipeline overlaps
+We don't wait for all 60 expert layers to load.  Instead, the pipeline overlaps
 loading of layer $\ell + 1$'s expert with computation of layer $\ell$:
 
 ```
@@ -62,11 +71,12 @@ Compute:  [              ][Compute ℓ     ][Compute ℓ+1   ][Compute ℓ+2   ]
 
 Effective per-layer time: `max(load_time, compute_time)`
 
-- Load time (average): 0.79 ms (70% delta) 
-- Compute time (average): 0.03 ms (ternary GEMM)
-- **Effective: 0.79 ms/layer × 80 layers = 63.1 ms/token**
+- Load time (average): 1.43 ms (70% delta, 7 GB/s sustained)
+- Compute time (average): ~0.14 ms (ternary GEMM target)
+- **Effective: 1.43 ms/layer × 60 expert layers = 85.7 ms/token**
 
-The compute is fully hidden behind the load.
+The design assumes compute is mostly hidden behind the load; this has not
+been measured end-to-end.
 
 ### 2.3  Prediction-Ahead Prefetch
 
@@ -80,49 +90,51 @@ At layer ℓ, compute:
 Start loading expert_ℓ+2 while computing layer ℓ.
 ```
 
-Prediction accuracy at $k = 1$: ~87% (since hidden states change slowly
-between adjacent layers).
+Prediction accuracy target at $k = 1$: ~87% (based on the hypothesis that
+hidden states change slowly between adjacent layers).
 
-If the prediction is wrong: stall for one full expert load (2.13 ms worst
-case); happens ~13% of the time at depth 1.
+If the prediction is wrong: stall for one full expert-layer load (3.86 ms
+worst case at the § 02 sustained-bandwidth assumption); target miss rate ~13%
+at depth 1.
 
 Expected mean load time with 1-ahead prediction:
 
 $$
-t = 0.87 \times 0 + 0.13 \times 2.13 \text{ ms} = 0.277 \text{ ms/layer (full miss)}
+t = 0.87 \times 0 + 0.13 \times 3.86 \text{ ms} = 0.502 \text{ ms/layer (full miss)}
 $$
 
 Combined with delta streaming (70% of correct predictions use delta):
 
 $$
-t = 0.87 \times [0.7 \times 0 + 0.3 \times 0] + 0.13 \times [0.7 \times 0.21 + 0.3 \times 2.13]
+t = 0.87 \times [0.7 \times 0 + 0.3 \times 0] + 0.13 \times [0.7 \times 0.40 + 0.3 \times 3.86]
 $$
 $$
-t = 0 + 0.13 \times [0.147 + 0.639] = 0.13 \times 0.786 = 0.102 \text{ ms/layer}
+t = 0 + 0.13 \times [0.280 + 1.158] = 0.13 \times 1.438 = 0.187 \text{ ms/layer}
 $$
 
 Wait — with prediction-ahead, correct predictions cost 0 because we
 pre-loaded.  So:
 
 $$
-t_{\text{effective}} = 0.102 \text{ ms/layer} \times 80 = 8.16 \text{ ms/token}
+t_{\text{effective}} = 0.187 \text{ ms/layer} \times 60 = 11.2 \text{ ms/token}
 $$
 
-**Throughput with prediction-ahead: ~122 tok/s** — but this is optimistic
-and assumes perfect parallelism.
+**Illustrative prediction-ahead upper bound: ~89 tok/s** before other runtime
+costs — optimistic, unmeasured, and not used as the baseline.
 
-### 2.4  Realistic Throughput Estimates
+### 2.4  Projected Throughput Estimates (Bandwidth Model; Unmeasured)
 
 | Configuration | ms/token | tok/s |
 |--------------|----------|-------|
-| No prefetch, all full loads | 170 | 5.9 |
-| No prefetch, 70% delta | 63 | 15.8 |
-| 1-ahead prefetch, 70% delta | 30–40 | 25–33 |
-| 2-ahead prefetch, 70% delta | 20–30 | 33–50 |
-| **Conservative estimate** | **70** | **~14** |
-| **Expected typical** | **50** | **~20** |
+| No prefetch, all full loads | ~238 | ~4.2 |
+| No prefetch, 70% delta | ~93 | ~10.8 |
+| 1-ahead prefetch, 70% delta | Target: 50–90 | Target: 11–20 |
+| 2-ahead prefetch, 70% delta | Target: 35–70 | Target: 14–29 |
+| **Conservative projected baseline** | **~93** | **~10.8** |
+| **Aspirational tuned runtime** | **70–90** | **~11–14** |
 
-We target **12–14 tok/s** as the conservative baseline.
+We use **~10.8 tok/s projected** as the conservative baseline until the
+runtime is implemented and benchmarked.
 
 ---
 
@@ -149,7 +161,7 @@ We target **12–14 tok/s** as the conservative baseline.
 
 | Component | Size (GB) | Notes |
 |-----------|----------|-------|
-| Hot expert cache (8 experts) | 12.8 | 8 × 1.6 GB (ternary packed) |
+| Hot expert cache (8 experts) | 13.0 | 8 × 1.624 GB (ternary packed) |
 | Read-ahead buffer | 0.5 | For NVMe prefetch |
 | HDM banks (2000) | 0.0025 | Index only |
 | FMEA LoRA workspace | 0.011 | During adaptation |
@@ -169,10 +181,10 @@ model/
 │   ├── spp_config.bin          (24 MB)
 │   └── hdm_codebook.bin        (5 MB)
 ├── experts/
-│   ├── expert_000.trit         (1.6 GB each)
+│   ├── expert_000.trit         (1.624 GB each)
 │   ├── expert_001.trit
 │   ├── ...
-│   └── expert_127.trit         (total: ~205 GB)
+│   └── expert_127.trit         (total: ~208 GB)
 ├── deltas/
 │   ├── delta_000_001.trd       (~160 MB each, sparse)
 │   ├── delta_000_016.trd       (neighbours on torus)
@@ -184,7 +196,10 @@ model/
     └── model_config.json        (hyperparameters)
 ```
 
-**Total NVMe: ~230–250 GB**
+Packed format: 5 trits/byte = 1.6 bits/param = 0.2 B/param.  One expert
+file is 8.12B params × 0.2 B/param = **1.624 GB**.
+
+**Total NVMe: ~230–253 GB**
 
 ---
 
@@ -198,7 +213,7 @@ fn generate(prompt: &[u32], max_tokens: usize) -> Vec<u32> {
     let mut pdr_states = init_pdr_states();  // 60 × [d_model, rank]
     let mut kv_cache = KVCache::new();       // For 20 GQA layers
     let mut output_tokens = Vec::new();
-    let mut prev_experts = [NONE; 80];       // Last expert per layer
+    let mut prev_experts = [NONE; 60];       // Last expert per expert layer
     
     // Process prompt (prefill)
     for layer in 0..80 {
@@ -211,29 +226,25 @@ fn generate(prompt: &[u32], max_tokens: usize) -> Vec<u32> {
         let token_hidden = hidden.last_token();
         
         // Layer-streamed forward pass
+        let mut expert_slot = 0;
         for layer in 0..80 {
-            // 1. Route: which expert?
-            let expert_id = manifold_route(token_hidden, layer);
-            
-            // 2. Load expert (async, double-buffered)
-            let expert_future = load_expert_async(
-                layer, expert_id, prev_experts[layer]);
-            
-            // 3. Compute attention/PDR (doesn't need expert)
+            // 1. Compute attention/PDR
             token_hidden = if layer < 60 {
                 pdr_forward(token_hidden, &mut pdr_states[layer])
             } else {
                 gqa_forward(token_hidden, &mut kv_cache, layer - 60)
             };
-            
-            // 4. Await expert (should already be loaded)
-            let expert_weights = expert_future.await;
-            
-            // 5. Expert FFN (ternary GEMM)
-            token_hidden = ternary_ffn(token_hidden, &expert_weights);
-            
-            // 6. Update tracking
-            prev_experts[layer] = expert_id;
+
+            // 2. Expert FFN on the 60 expert-bearing layers
+            if layer < 60 {
+                let expert_id = manifold_route(token_hidden, layer);
+                let expert_future = load_expert_async(
+                    layer, expert_id, prev_experts[expert_slot]);
+                let expert_weights = expert_future.await;
+                token_hidden = ternary_ffn(token_hidden, &expert_weights);
+                prev_experts[expert_slot] = expert_id;
+                expert_slot += 1;
+            }
         }
         
         // LM head
@@ -270,8 +281,9 @@ parallel through each layer:
 - Expert routing: batch route all prompt tokens, load top-1 per layer
   (majority vote over tokens)
 
-Prefill throughput: **~100–200 tok/s** (compute-bound, not PCIe-bound,
-because one expert serves all prompt tokens per layer).
+Projected prefill throughput: **~100–200 tok/s** (compute-bound, not
+PCIe-bound, because one expert serves all prompt tokens per layer).  This is
+unmeasured.
 
 ### 4.3  Decode Phase
 
@@ -301,8 +313,8 @@ to load).
 
 ### 5.2  Cache Warming
 
-On startup, pre-load the 8 most commonly routed experts (based on
-historical frequency from training data):
+On startup, pre-load the 8 most commonly routed experts (intended to come from
+training or deployment routing statistics):
 
 ```rust
 fn warm_cache(cache: &mut ExpertCache) {
@@ -314,18 +326,18 @@ fn warm_cache(cache: &mut ExpertCache) {
 }
 ```
 
-Cache warming takes ~12.8 seconds (8 × 1.6 GB / 1 GB/s NVMe read).
+Projected cache warming takes ~13.0 seconds (8 × 1.624 GB / 1 GB/s NVMe read).
 
 ### 5.3  Cache Hit Rates
 
-Based on token routing distributions from training:
+Target cache hit rates, pending trained routing distributions:
 
 | Scenario | Cache hit rate | Effective tok/s |
 |----------|---------------|-----------------|
 | Homogeneous topic | ~60% | ~20 |
 | Mixed conversation | ~30% | ~15 |
 | Topic switching | ~10% | ~12 |
-| **Weighted average** | **~35%** | **~14** |
+| **Weighted average** | **Target: ~35%** | **Projected: ~10–11 baseline; higher if cache hits reduce transfers** |
 
 ---
 
@@ -378,7 +390,7 @@ fn mpd_decode(logits: &Tensor, states: &PdrStates, kv: &KVCache) -> Tensor {
 }
 ```
 
-### 6.4  MPD Compute Cost
+### 6.4  MPD Compute Cost (Projected; Unmeasured)
 
 Each additional perspective requires a partial forward pass (only the last
 few layers, not the full 80):
@@ -427,18 +439,18 @@ where $a_i^0$ is the initial adapter value and $\lambda = 0.01$.
 ## 8  Startup Sequence
 
 ```
-1. Load model_config.json         (~1 ms)
-2. Load shared layers to VRAM     (~1.7 s at 1 GB/s)
-3. Load router weights to VRAM    (~0.04 s)
-4. Load SPP config to VRAM        (~0.02 s)
-5. Load HDM codebook to VRAM      (~0.005 s)
-6. Load embeddings to VRAM        (~0.13 s)
-7. Initialise PDR states          (~0.001 s)
-8. Initialise KV cache            (~0.001 s)
-9. Warm expert cache (8 experts)  (~12.8 s)
-10. Run health check              (~0.5 s)
+1. Load model_config.json         (projected ~1 ms)
+2. Load shared layers to VRAM     (projected ~1.7 s at 1 GB/s)
+3. Load router weights to VRAM    (projected ~0.04 s)
+4. Load SPP config to VRAM        (projected ~0.02 s)
+5. Load HDM codebook to VRAM      (projected ~0.005 s)
+6. Load embeddings to VRAM        (projected ~0.13 s)
+7. Initialise PDR states          (projected ~0.001 s)
+8. Initialise KV cache            (projected ~0.001 s)
+9. Warm expert cache (8 experts)  (projected ~13.0 s)
+10. Run health check              (target ~0.5 s)
                         ──────────────────
-              Total startup:  ~15.2 seconds
+              Total startup target:  ~15.4 seconds
 ```
 
 ---
@@ -451,7 +463,7 @@ On shutdown, persist:
 3. **Expert cache frequency table** (1 KB) — for next warm start
 4. **HDM bank updates** (variable) — session memory
 
-Total persistence write: ~124 MB → ~0.12 s.
+Projected persistence write: ~124 MB → ~0.12 s.
 
 ---
 

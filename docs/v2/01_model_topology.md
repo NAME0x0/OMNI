@@ -67,6 +67,9 @@ x_in ∈ R^{B×d}   (B = batch, d = 4096)
 **Key detail:** The expert FFN weights (`W_g`, `W_u`, `W_d`) are ternary
 {-1, 0, +1} and streamed one layer at a time from RAM → VRAM via
 double-buffered DMA.  Only ~27 MB occupies the GPU at any moment.
+This distinguishes ternary information content (≈1.58 bits/param) from
+the stored/streamed format: 1.6 bits/param (5 trits per byte), giving
+135.3M params ≈ 27 MB per expert-layer.
 
 ### 2.2  GQA + Shared FFN Layer (×20)
 
@@ -206,9 +209,12 @@ all 80 layers.
 
 ---
 
-## 8  Token-Level Pipeline Summary
+## 8  Projected Per-Token Latency (Bandwidth Model, Not Measurement)
 
 For a single token at decode time:
+
+The timings below derive from the §02 bandwidth model; they are projections,
+not measurements.
 
 ```
  1. Embed token                              →   0.01 ms
@@ -227,7 +233,7 @@ For a single token at decode time:
  4. SPP projection                           →   0.01 ms
  5. Sample token                             →   0.001 ms
 ────────────────────────────────────────────────────
- Total (PCIe-bound):  ~70–80 ms  →  12–14 tok/s
+ Total (PCIe-bound):  ~93 ms  →  ~10.8 tok/s (projected; see §02 §5)
 ```
 
 ---

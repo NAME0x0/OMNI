@@ -1,9 +1,12 @@
 //! Model weight provider: loads and serves expert weights from disk.
 //!
 //! Supports:
-//! - Memory-mapped files (zero-copy NVMe access)
 //! - Hot expert cache in RAM
 //! - Delta-based partial loading
+//!
+//! Note: loading currently always goes through `std::fs::read` (a full
+//! buffered read into a `Vec<u8>`). Memory-mapped, zero-copy NVMe access is
+//! future work and is not implemented yet.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,7 +34,7 @@ pub struct ShardInfo {
 }
 
 /// Expert weight data loaded into memory.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ExpertWeights {
     /// Raw ternary-packed weight data.
     pub data: Vec<u8>,
@@ -70,9 +73,6 @@ pub struct ProviderConfig {
     /// Maximum RAM cache size in bytes.
     pub max_cache_bytes: u64,
 
-    /// Whether to use memory-mapped I/O.
-    pub use_mmap: bool,
-
     /// Prefetch depth (how many layers ahead to load).
     pub prefetch_depth: usize,
 }
@@ -83,7 +83,6 @@ impl Default for ProviderConfig {
             model_dir: PathBuf::from("./model"),
             max_cached_experts: 8,
             max_cache_bytes: 16 * 1024 * 1024 * 1024, // 16 GB
-            use_mmap: true,
             prefetch_depth: 2,
         }
     }
@@ -271,13 +270,12 @@ impl WeightProvider {
                 is_delta: shard.is_delta,
             })
         } else {
-            // Return empty weights if no shard found
-            Ok(ExpertWeights {
-                data: Vec::new(),
-                expert_id,
-                layer,
-                is_delta: false,
-            })
+            // No shard registered for this (layer, expert) pair. Silently
+            // returning empty weights here would let garbage (all-zero /
+            // missing) weights propagate into the model; fail loudly instead.
+            Err(anyhow::anyhow!(
+                "no shard registered for layer {layer}, expert {expert_id}"
+            ))
         }
     }
 
@@ -472,6 +470,33 @@ mod tests {
             .expect("second expert load should succeed");
         assert_eq!(provider.cached_count(), 1);
         assert!(provider.stats.evictions >= 1);
+    }
+
+    #[test]
+    fn test_get_expert_errors_on_unregistered_shard() {
+        let dir = tempdir().expect("failed to create tempdir");
+        write_shard_file(dir.path(), 0, 0, &[1, 2, 3, 4]);
+
+        let config = ProviderConfig {
+            model_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut provider = WeightProvider::new(config);
+        provider
+            .scan_model_dir()
+            .expect("scan_model_dir should succeed");
+
+        // Expert (0, 1) has no shard on disk / registered in the index.
+        let result = provider.get_expert(0, 1);
+        assert!(
+            result.is_err(),
+            "expected an error for an unregistered shard, got Ok"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no shard registered"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]

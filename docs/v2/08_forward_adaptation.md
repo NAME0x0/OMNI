@@ -7,6 +7,11 @@
 
 ## 1  Motivation
 
+**Status:** FMEA is a design with partial CPU reference components.  The
+memory figures below are derivations from adapter dimensions; timing and
+quality effects are projected from the § 02 bandwidth model and have not been
+benchmarked end-to-end on a trained PERSPECTIVE model.
+
 Standard continual learning approaches:
 
 | Method | Memory | Problem |
@@ -30,7 +35,8 @@ Two complementary gradient-free learning mechanisms:
    perturb expert coordinates, measure fitness, update via estimated
    gradient.
 
-Together: O(1) memory overhead, ~1 forward-pass equivalent per update step.
+Together: O(1) activation-memory overhead, with a design target of roughly one
+forward-pass equivalent per JVP direction.
 
 ---
 
@@ -98,11 +104,11 @@ Input: current LoRA params θ = {A^(ℓ), B^(ℓ)}_{ℓ=1}^{60}
 | One tangent vector v_k | 3.75 MB |
 | Directional derivatives (K=8 scalars) | 64 bytes |
 | Gradient estimate ĝ | 3.75 MB |
-| **Total** | **~11 MB** |
+| **Total** | **~11 MB derived workspace** |
 
 Compare with backprop LoRA:
-- Activation storage for 80 layers: ~800 MB – 2 GB
-- **FMEA is 72–180× more memory-efficient**
+- Activation storage for 80 layers: projected ~800 MB – 2 GB
+- **FMEA target:** 72–180× lower adaptation workspace than backprop LoRA
 
 ### 2.5  Convergence Properties
 
@@ -113,13 +119,13 @@ $$
 \text{Var}[\hat{g}] = \frac{\|\nabla L\|^2}{K} \cdot \left(\frac{|\theta|}{K} - 1\right)
 $$
 
-With |θ| = 2M and K = 8, variance is high — but we're doing tiny
-incremental adaptation, not full training.  The signal-to-noise ratio
-is sufficient for:
+With |θ| = 2M and K = 8, variance is high.  The design intent is tiny
+incremental adaptation, not full training; whether the signal-to-noise ratio
+is sufficient must be validated for:
 
 - Learning user preferences (style, tone, format)
 - Incorporating corrections ("actually, it's X not Y")
-- Adapting to new domains over ~100 examples
+- Adapting to new domains over a target scale of ~100 examples
 
 **Not** sufficient for:
 - Fundamental capability improvement (that requires pre-training)
@@ -166,13 +172,13 @@ Input: expert positions z = {z_1, ..., z_128}
 |----------|------|
 | Perturbation storage | 16 × 384 × 4 bytes = 24 KB |
 | Forward passes per update | 16 (one per perturbation) |
-| Wall time per update | 16 × 93 ms = ~1.5 s |
+| Wall time per update | Projected: 16 × 93 ms = ~1.5 s |
 | Update frequency | Every 50 tokens |
 
-This is lightweight enough to run asynchronously — while the user reads
-the model's output, FMEA can complete several routing updates.
+The design target is to run this asynchronously while the user reads the
+model's output.  That scheduling assumption is unmeasured.
 
-### 3.4  What Routing Evolution Achieves
+### 3.4  What Routing Evolution Is Intended to Achieve
 
 - **Topic adaptation:** expert coverage shifts toward the current domain
 - **User-specific routing:** frequently-needed expert regions get more
@@ -189,20 +195,21 @@ Every 50 tokens (background, between user turns):
 
 1. Collect recent token buffer (last 50 tokens + losses)
 
-2. LoRA update (JVP):
+2. LoRA update (JVP, projected timing):
    - 8 random perturbation directions
    - 8 forward passes (each ~93 ms = 744 ms total)
    - Gradient estimate + update: < 1 ms
    - Total: ~0.75 s
 
-3. Routing evolution (NES):
+3. Routing evolution (NES, projected timing):
    - 16 perturbations of expert positions
    - 16 forward passes (~1.5 s total)
    - Gradient estimate + position update: < 1 ms
    - Total: ~1.5 s
 
-4. Total adaptation time: ~2.25 s per 50 tokens
-   (runs during user think time — no impact on generation speed)
+4. Total adaptation time target: ~2.25 s per 50 tokens
+   (intended to run during user think time; no-impact scheduling requires
+   runtime validation)
 ```
 
 ---
@@ -211,8 +218,9 @@ Every 50 tokens (background, between user turns):
 
 ### 5.1  LoRA Isolation
 
-LoRA adapters are **separate** from base weights.  The base model is frozen.
-Even if LoRA adapts destructively, the base model's knowledge is intact.
+LoRA adapters are **separate** from base weights.  The base model is frozen,
+so destructive adapter updates can be rolled back without rewriting base
+weights.  This limits one forgetting path but does not prove quality stability.
 
 Reset strategy: if adaptation degrades quality (measured by MPD agreement
 scores dropping), revert LoRA to the last checkpoint:
@@ -225,14 +233,15 @@ if avg_agreement(last_100_tokens) < 0.5 * avg_agreement(baseline):
 
 ### 5.2  Routing Manifold Anchoring
 
-Expert positions have an **elastic potential** that resists large moves:
+Expert positions have an **elastic potential** intended to resist large moves:
 
 $$
 \mathcal{L}_{\text{anchor}} = \lambda_a \sum_{i=1}^{128} \| z_i - z_i^{(0)} \|^2
 $$
 
-where $z_i^{(0)}$ is the original trained position.  This prevents experts
-from collapsing into a small region of the torus.
+where $z_i^{(0)}$ is the original trained position.  This is designed to
+discourage experts from collapsing into a small region of the torus; the
+strength must be validated against trained routing behaviour.
 
 $\lambda_a = 0.1$ — strong enough to prevent catastrophic drift, weak enough
 to allow meaningful adaptation.
@@ -247,8 +256,8 @@ to allow meaningful adaptation.
 | LoRA (backprop) | O(activations) | Yes | Adapters | Low |
 | Prompt tuning | O(prompt × d) | Yes | Virtual tokens | None |
 | ICL (in-context) | O(examples × d) | No | None | None but ephemeral |
-| **FMEA-LoRA** | **11 MB** | **No** | **2M adapter params** | **Low (isolated)** |
-| **FMEA-NES** | **24 KB** | **No** | **384 routing coords** | **Low (anchored)** |
+| **FMEA-LoRA** | **~11 MB derived** | **No** | **2M adapter params** | **Target: low (isolated)** |
+| **FMEA-NES** | **24 KB derived** | **No** | **384 routing coords** | **Target: low (anchored)** |
 
 ---
 
@@ -266,9 +275,10 @@ i.e., the estimate is **unbiased**.  Convergence rate is $O(d/K)$ slower
 than true gradient descent (where $d$ = param count, $K$ = perturbation
 directions).  With d = 2M and K = 8, we converge ~250,000× slower per step.
 
-But each step is also ~250,000× cheaper in memory and ~1× in compute
-(one forward pass vs one forward + one backward).  For the small
-incremental updates we need at inference time, this is more than sufficient.
+But each step is also projected to be ~250,000× cheaper in parameter-gradient
+memory and roughly forward-pass-scale in compute.  For small incremental
+updates at inference time, this is a design hypothesis rather than a measured
+quality result.
 
 ### 7.2  NES for Non-Differentiable Routing
 

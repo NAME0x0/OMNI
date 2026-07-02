@@ -31,6 +31,9 @@ Standard dense transformer deployments fail this hardware envelope. This design 
 | Vocabulary | 32768 |
 | Expert manifold | 3D torus (`T^3`) on 8x4x4 lattice |
 | Expert precision | Ternary (`{-1,0,+1}`) |
+| Expert storage | ~208 GB for 128 experts at 1.6 bits/param |
+| NVMe footprint | ~253 GB total with deltas |
+| Decode throughput | ~10-11 tok/s projected by bandwidth model |
 
 ## 3. Core Components
 
@@ -53,7 +56,9 @@ Standard dense transformer deployments fail this hardware envelope. This design 
 | GPU kernels | Not complete | CUDA/HIP/SYCL dispatch remains fallback-heavy/stubbed in places |
 | Training system | Not implemented end-to-end | No full trainer/data/checkpoint/eval pipeline yet |
 | Safety/decoding/learning components | Prototype level | Core logic present; full integration and scale validation pending |
-| Docs v2 alignment | Improved | Significant consistency fixes applied; further ongoing verification expected |
+| Test suite | Passing | 243 tests pass; prior full-suite memory crash fixed with dimension-parameterised tiny test configs |
+| Docs v2 alignment | Honesty pass applied | Claims are labelled measured/projected/target where known |
+| Legacy docs | Archived | Superseded v1 docs live under `docs/legacy/` |
 
 ## 5. Roadmap Checklist (Tracking)
 
@@ -66,10 +71,15 @@ This section is the project execution checklist. Use it as the canonical done/pe
 - [x] Wire Rust FFI bridge for native manifold fold + nearest-expert operations
 - [x] Add ZeroClaw runtime adapter and CLI task hook (`--swarm-task`)
 - [x] Update affected `docs/v2` manifold and adaptation references to 3D/fold language
+- [x] Archive v1 (OMNIS) docs to `docs/legacy` with superseded banners
+- [x] Fix full-suite memory crash (dimension-parameterised test configs); 243 tests passing
+- [x] Fix SPP hull-blend feasibility bug + remove false attack-immunity claims
+- [x] Fix HDM PRNG seed-correlation defect (splitmix64); measure per-bank capacity curve (`examples/hdm_capacity.rs`)
+- [x] Measure routing balance at init (`examples/routing_balance.rs`)
+- [x] Rewrite training plan with corrected compute math + Stage 0 validation gate
 
 ### 5.2 Required For "True LLM" Readiness
 - [ ] Implement full token processing path in `src/runtime/pipeline.rs` (replace fail-fast placeholder with real execution)
-- [ ] Resolve full-suite memory crash and stabilize all tests under CI
 - [ ] Build end-to-end training stack (data ingest, tokenizer pipeline, trainer loop, checkpoints, resume)
 - [ ] Complete GPU backend kernels and remove fallback-only paths for core hot loops
 - [ ] Add distributed training orchestration (multi-GPU / multi-node execution and recovery)
@@ -110,6 +120,8 @@ cargo test routing:: --features native-manifold
 cargo run -- --model-dir ./model -n 128 "Your prompt here"
 ```
 
+Note: the inference pipeline is not yet functional - `process_token` returns an error by design until the full execution path is implemented. The CLI currently exercises configuration, health, and (optionally) ZeroClaw dispatch only.
+
 ### ZeroClaw task dispatch
 ```bash
 cargo run -- --swarm-task "your agentic task" --zeroclaw-bin zeroclaw --swarm-workspace .
@@ -149,6 +161,8 @@ docs/v2/       # architecture specification and validation documents
 | `docs/v2/11_inference_pipeline.md` | inference pipeline and latency model |
 | `docs/v2/12_validation_v2.md` | validation framework |
 | `docs/v2/13_issue_matrix.md` | issue-to-component mapping |
+| `docs/v2/14_extensions.md` | future extensions adopted from v1 |
+| `docs/legacy/` | superseded v1 architecture, retained for history |
 
 ## 9. Contribution Standard
 

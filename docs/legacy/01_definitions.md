@@ -1,3 +1,12 @@
+> **⚠️ SUPERSEDED — LEGACY DOCUMENT**
+>
+> This file describes the v1 "OMNIS-SINGULARITY" architecture (~2.5B GLA MoE),
+> which has been superseded by the v2 "PERSPECTIVE" architecture.
+> The implementation in `src/` follows [`docs/v2/`](../v2/00_V2_INDEX.md), not this document.
+> Retained for design history only. Claims in this file are not maintained
+> and may contradict the current specification.
+
+
 # Section 1: Definitions & Equivalence Metric
 
 ## 1.1 What "1.5T Reasoning Equivalence" Means

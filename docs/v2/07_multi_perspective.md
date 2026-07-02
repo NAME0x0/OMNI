@@ -63,7 +63,7 @@ For token position t:
     
     logits_p[t] = output_head(h_t)
     
-  // Compare the four logit distributions
+  // Compare the four logit distributions (legacy name; this is JSD disagreement)
   agreement[t] = compute_agreement(logits_0..3)
 ```
 
@@ -80,8 +80,9 @@ MPD is **not** run on every token.  The selective strategy:
 Expected MPD activation rate: ~20% of tokens.
 
 Compute overhead: 4× on 20% of tokens = **1.6× average** (not 4×).
-With the base pipeline at 10.8 tok/s, MPD reduces to ~6.8 tok/s effective.
-But see § 2.3 for optimisation.
+Using the projected § 02 bandwidth model, the base pipeline is estimated at
+10.8 tok/s and MPD reduces to ~6.8 tok/s effective.  But see § 2.3 for
+optimisation.
 
 ### 2.3  Sequential Perspective Reuse
 
@@ -104,9 +105,10 @@ Layer 1:  Compute P₀_L1     | Load P₀_expert_L2 | Compute P₁_L1
 ```
 
 With careful scheduling, 4 perspectives cost ~2× the PCIe time (not 4×)
-because the GPU is otherwise idle during transfers.
+because the GPU is otherwise idle during transfers.  This is a projection
+that depends on the unvalidated PCIe interleaving trick above.
 
-Revised overhead: **1.38× average** at 20% MPD rate.
+Revised overhead target: **1.38× average** at 20% MPD rate.
 
 ---
 
@@ -122,20 +124,22 @@ $$
 $$
 
 where JSD is the Jensen–Shannon divergence between softmax distributions.
+Despite the legacy name `agree`, this is a **disagreement score**: 0 means
+perfect agreement, and larger values mean more divergence.
 
 - $\text{agree}(t) \approx 0$: all perspectives produce near-identical
   distributions → **high confidence**
 - $\text{agree}(t) > \tau$: distributions diverge → **uncertainty detected**
 
-Threshold $\tau = 0.15$ (calibrated on validation set).
+Threshold target $\tau = 0.15$ (to be calibrated on validation data).
 
 ### 3.2  Token Selection
 
-When $\text{agree}(t) < \tau$:
+When $\text{agree}(t) < \tau$ (low disagreement):
 - Select token from P₀ (base perspective)
 - Confidence: $c_t = 1 - \text{agree}(t) / \tau$
 
-When $\text{agree}(t) \geq \tau$:
+When $\text{agree}(t) \geq \tau$ (high disagreement):
 - **Majority vote:** pick the token that appears in ≥ 2 of 4 perspectives
 - If no majority: trigger HDM retrieval (§ 3.3)
 - Confidence: $c_t = (\text{majority count}) / 4 - 0.25$ (scaled)
@@ -150,17 +154,17 @@ When perspectives disagree and no majority exists:
 3. If HDM returns a relevant fact:
    a. Inject fact as context (virtual token at layer 40)
    b. Re-run the 4 perspectives from layer 40 onward
-   c. If agreement improves → use retrieval-augmented result
-   d. If still no agreement → select P₀ + flag as uncertain
+   c. If disagreement decreases → use retrieval-augmented result
+   d. If still high disagreement → select P₀ + flag as uncertain
 4. If HDM returns nothing:
    a. Select P₀ + flag as uncertain
    b. Optionally: refuse to generate ("I'm not sure about this")
 ```
 
-### 3.4  Calibration Properties
+### 3.4  Calibration Hypothesis
 
-**Claim:** MPD's agreement score is a well-calibrated confidence estimate
-without any learned calibration.
+**Hypothesis:** MPD's disagreement score can become a well-calibrated
+confidence estimate without any learned calibration.
 
 **Intuition:** If 4 independent-ish computations agree, the answer is
 robust to perturbation.  This is a form of **ensemble calibration** where
@@ -169,13 +173,13 @@ the ensemble is internal (different routing paths) rather than external
 
 **Expected Calibration Error (ECE) target:** ≤ 0.08
 
-Derivation: with 4 perspectives and the JSD threshold:
+Illustrative hypothesised values to validate after a model is trained:
 - Tokens with agree < 0.05: ~95% correct → calibrated confidence ~0.95
 - Tokens with agree 0.05–0.10: ~82% correct
 - Tokens with agree 0.10–0.15: ~65% correct
 - Tokens with agree ≥ 0.15: ~40% correct → triggers retrieval/refusal
 
-This maps naturally to a well-calibrated confidence curve.
+This is the target calibration curve, not a measured result.
 
 ---
 
@@ -190,9 +194,12 @@ In Perspective:
 - Hallucinated facts are typically supported by only one expert configuration
 - The other 3 perspectives (especially P₂ antipodal) tend to generate
   different fabrications or hedge
-- This shows up as high JSD in the agreement score
+- This shows up as high JSD in the disagreement score
 
 ### 4.2  Expected Performance
+
+Speculative targets only: no PERSPECTIVE model has been trained, so these
+numbers have no empirical basis yet.
 
 | Metric | Standard LLM | With MPD |
 |--------|-------------|---------|
@@ -230,14 +237,14 @@ qualify its response.
 When MPD detects uncertainty in a completed sentence:
 
 ```
-IF max(agree_scores[sentence]) > τ:
-  1. Identify the uncertain span (contiguous tokens with high agree_score)
+IF max(jsd_scores[sentence]) > τ:
+  1. Identify the uncertain span (contiguous tokens with high JSD)
   2. Query HDM with the span embedding
   3. Re-generate the span with:
      a. HDM context injected
      b. Explicit system instruction: "verify the following claim"
   4. Compare original and re-generated spans
-  5. If different and re-generation has lower agreement:
+  5. If different and re-generation has lower disagreement:
      → Replace original span with re-generated version
   6. If still uncertain:
      → Append qualifier: "I'm not fully certain about this"
@@ -253,6 +260,9 @@ and evidence retrieval.
 
 ### 7.1  Non-MPD Token (80% of tokens)
 
+Throughput figures in this section are projected from the § 02 bandwidth
+model, not benchmarked runtime.
+
 ```
 embed → 80 layers (PDR/GQA + expert/shared FFN) → output head → SPP → sample
 Time: ~93 ms / 10.8 tok/s
@@ -265,8 +275,8 @@ embed → 80 layers (shared work once)
   → fork 4 perspectives
   → expert FFN × 4 (interleaved, PCIe-bound)
   → 4 × output head
-  → agreement analysis
-  → IF agree < τ: select + continue
+  → disagreement analysis
+  → IF agree < τ: select + continue  // low disagreement; `agree` is legacy name
     ELIF HDM hit: inject + re-run from layer 40 → select
     ELSE: P₀ + uncertainty flag
   → SPP → sample
@@ -284,10 +294,11 @@ Amortised: ~112 ms / 8.9 tok/s
 | RLHF | Reward model + PPO | Yes (expensive) | 0% at inference | 0.08–0.15 |
 | Self-consistency (Wang+ 23) | Sample multiple, majority vote | No | 5–10× | 0.04–0.08 |
 | Verbalized confidence | Ask model "how sure are you?" | No | ~1.5× | 0.15–0.25 |
-| **MPD (ours)** | **4 routing perspectives + agreement** | **No** | **1.38×** | **≤ 0.08** |
+| **MPD (ours)** | **4 routing perspectives + JSD disagreement** | **No** | **1.38× target** | **≤ 0.08 target** |
 
-MPD achieves self-consistency-class calibration at ~7× lower compute
-overhead by using internal diversity (routing) instead of external sampling.
+The MPD row is a design target; the other rows are published measurements, so
+this table is apples-to-oranges without that caveat.  The 1.38× overhead
+depends on the unvalidated PCIe interleaving trick in § 2.3.
 
 ---
 

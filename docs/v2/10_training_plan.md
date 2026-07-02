@@ -1,7 +1,7 @@
 # § 10 — Training Plan
 
 > You don't train 1T parameters from scratch on a laptop.
-> Here's how to actually build this model.
+> Here's what it would take to validate and train this model honestly.
 
 ---
 
@@ -9,22 +9,68 @@
 
 Training a 1.05T sparse MoE with natively ternary experts is a
 multi-stage process.  The key insight: **not all parameters train
-simultaneously**.  The shared layers train densely; experts train in
-rotation; ternary quantization is progressive.
+simultaneously**.  The shared layers train densely; experts train through
+top-1 routing; ternary quantisation is progressive.
+
+This plan is not yet an empirical result.  The PDR architecture, manifold
+routing, ternary expert recipe, and loss interactions all require small-scale
+validation before any large training spend is justified.
 
 ### Stages
 
 | Stage | What trains | Precision | Hardware | Duration |
 |-------|-----------|-----------|----------|----------|
-| 1. Dense seed | Shared layers only (6.83B) | FP16 | 8 × A100 (80GB) | ~2 weeks |
-| 2. Expert initialisation | Clone shared FFN → 128 experts | — | CPU | 1 hour |
-| 3. Expert differentiation | Route + train experts (FP16) | FP16 | 32 × A100 | ~4 weeks |
-| 4. Ternary distillation | Progressively quantise experts to ternary | FP16→ternary | 32 × A100 | ~2 weeks |
-| 5. Manifold alignment | Train routing manifold + delta minimisation | Mixed | 8 × A100 | ~1 week |
+| 0. Small-scale architecture validation | 125M PDR, GLA, transformer baselines; ternary gate | BF16/ternary | 1–8 consumer/A100 GPUs | ~2–5 days |
+| 1. Dense seed | Shared layers only (6.83B) | BF16 | ~128 × A100-80GB | ~30 days |
+| 2. Expert initialisation | Clone shared FFN → 128 experts | — | CPU/NVMe | 1–3 hours |
+| 3. Expert differentiation | Route + train experts | BF16 | ~128 × A100-80GB | ~33 days |
+| 4. Ternary distillation | Progressively quantise experts to ternary | BF16→ternary | ~128 × A100-80GB | ~18 days |
+| 5. Manifold alignment | Train routing manifold + neighbour delta minimisation | Mixed | 32–128 × A100-80GB | ~1–4 days |
 | 6. Safety anchoring | Compute SPP polytope | FP32 | CPU | 1 day |
-| 7. Evaluation + tuning | Benchmarks, ablations, hyperparameter sweep | Ternary | Consumer HW | ~1 week |
+| 7. Evaluation + tuning | Benchmarks, ablations, hyperparameter sweep | Ternary | Consumer HW + A100 eval nodes | ~1–2 weeks |
 
-**Total: ~10 weeks on 32 × A100-80GB** (estimated $50K–80K at cloud rates).
+**Total: ~11–13 weeks with a realistic ~128 A100-80GB allocation.**  The
+compute envelope is approximately **250,000 A100-hours**, or **$0.5M–1.5M
+depending on MFU achieved, spot pricing, restarts, and eval overhead**.
+
+---
+
+### Stage 0: Small-Scale Architecture Validation
+
+Stage 0 is a hard gate before committing large-scale compute.  The whole
+architecture rests on the unvalidated hypothesis that a full-rank perspective
+gate improves over lower-rank gated alternatives, and that ternary PDR/MoE
+training remains stable.  A small run can falsify those assumptions for less
+than the cost of a single large-scale restart.
+
+#### Models
+
+Train three ~125M-parameter models with matched dimensions and token budgets:
+
+| Variant | Configuration | Purpose |
+|---------|---------------|---------|
+| PDR variant | $d_{\text{model}} = 768$, 12 layers, 9 PDR + 3 GQA with period-4 interleave | Tests full-rank perspective gate |
+| GLA baseline | Same dimensions, low-rank gate | Controls against a known gated-linear design |
+| Vanilla transformer | Same dimensions and depth | Controls against standard attention/MLP |
+
+Use ~2.5B tokens, for example a SlimPajama subset.  This is roughly
+$6 \cdot 125\text{M} \cdot 2.5\text{B} \approx 1.9 \times 10^{18}$ FLOPs per
+model, so the full comparison fits on a single node with 1–8 consumer or A100
+GPUs.  Target budget: **<$500**.
+
+#### Gate Criteria
+
+The large training plan should not proceed unless all gates pass:
+
+| Gate | Requirement |
+|------|-------------|
+| PDR quality | PDR matches or beats the GLA baseline perplexity at equal parameters and tokens |
+| PDR implementation | Parallel-scan PDR matches the sequential reference within numerical tolerance |
+| Routing balance | Routing Gini remains < 0.15 during training, not just at initialisation |
+| Ternary viability | Ternarising the 125M PDR model with the Stage 4 STE recipe causes <10% relative perplexity degradation |
+
+The ternary gate matters because the large model assumes BitNet-style
+ternarisation works for PDR and sparse experts.  That has not been shown here.
 
 ---
 
@@ -37,7 +83,7 @@ experts:
 
 - 80 layers: 60 PDR + 20 windowed GQA
 - All FFN layers are shared (no routing)
-- Full FP16 precision
+- BF16 mixed precision
 - Standard AdamW optimiser
 
 ### 2.2  Data
@@ -64,7 +110,7 @@ model:
   gqa_kv_heads: 8
   ffn_intermediate: 11008
   vocab_size: 32768
-  
+
 optimizer:
   type: AdamW
   lr: 3e-4
@@ -73,27 +119,37 @@ optimizer:
   weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
-  
+
 training:
   batch_size: 2048 sequences × 4096 tokens = 8.4M tokens/batch
   total_steps: 120000 (~1T tokens)
   grad_clip: 1.0
   precision: BF16 (mixed)
-  
+
 hardware:
-  gpus: 8 × A100-80GB
-  parallelism: FSDP (Fully Sharded Data Parallel)
-  compute: ~3.2e21 FLOPs
-  time: ~14 days
+  realistic_allocation: ~128 × A100-80GB
+  parallelism: FSDP / ZeRO-style sharding
+  compute: 6 × 6.83e9 × 1e12 ≈ 4.1e22 FLOPs
+  effective_throughput: ~1.25e14 FLOP/s per A100 at 40% MFU
+  a100_hours: ~91,000
+  cloud_cost_at_3_usd_per_a100_hour: ~$275K
+  time_on_8_a100s: ~470 days
+  time_on_128_a100s: ~30 days
 ```
+
+The 8-GPU version is not a realistic schedule.  With the standard
+$6ND$ training FLOPs rule and ~40% MFU on A100-80GB BF16
+($312$ TFLOP/s peak → ~$1.25 \times 10^{14}$ FLOP/s effective), the dense
+seed alone is a month-scale 128-GPU job.
 
 ### 2.4  Expected Quality
 
-At 6.83B parameters trained on 1T tokens, the seed model should match or
-exceed LLaMA-7B quality:
+These are **speculative targets (no empirical basis — nothing has been
+trained)**.  They are useful only as a rough sanity check for evaluation
+planning.
 
-| Benchmark | LLaMA-7B | Expected seed |
-|-----------|----------|---------------|
+| Benchmark | LLaMA-7B | Speculative seed target |
+|-----------|----------|-------------------------|
 | MMLU | 35.1% | ~36% |
 | ARC-Challenge | 51.7% | ~52% |
 | GSM8K | 11.0% | ~12% |
@@ -123,7 +179,7 @@ Not yet differentiated — all experts in the same layer are identical.
 
 ### 4.1  Method
 
-Train with the full MoE architecture, standard routing, and a loss that
+Train with the full MoE architecture, standard top-1 routing, and a loss that
 encourages expert specialisation:
 
 $$
@@ -139,6 +195,12 @@ $$
 pushes experts apart, and $\mathcal{L}_{\text{balance}}$ ensures even
 routing distribution.
 
+This diversity objective is in tension with the Stage 5 delta-minimisation
+objective, which pulls some experts together.  The intended reconciliation is
+to apply diversity pressure to non-neighbour expert pairs and delta loss only
+to manifold-neighbour pairs.  That is still a design hypothesis and should be
+checked in Stage 0 or a follow-on small MoE run before full scale.
+
 ### 4.2  Router Pre-training
 
 The manifold router needs to learn meaningful projections.  During this
@@ -153,30 +215,53 @@ training:
   tokens: 500B (continued pre-training)
   batch_size: 1024 × 4096 = 4.2M tokens/batch
   optimizer: same as Stage 1, lr warmup from 1e-5 → 2e-4
-  
+
 moe:
   num_experts: 128
+  active_params_per_token: 14.95B
   top_k: 1
   balance_loss_alpha: 0.01
   diversity_loss_beta: 0.001
-  
+
 hardware:
-  gpus: 32 × A100-80GB
-  parallelism: Expert Parallelism + FSDP
-  experts_per_gpu: 4
-  time: ~28 days
+  realistic_allocation: ~128 × A100-80GB
+  parallelism: Expert Parallelism + FSDP/ZeRO
+  compute: 6 × 14.95e9 × 500e9 ≈ 4.5e22 FLOPs
+  a100_hours: ~100,000
+  cloud_cost_at_3_usd_per_a100_hour: ~$300K
+  time_on_128_a100s: ~33 days
 ```
 
-### 4.4  Expert Parallelism
+### 4.4  Expert Parallelism and Memory
 
-With 128 experts and 32 GPUs, each GPU hosts 4 experts.  AlltoAll
-communication routes tokens to the correct GPU for expert computation.
+The naive layout of 128 experts over 32 GPUs gives 4 experts per GPU.  That
+does **not** fit in A100-80GB once gradients and AdamW states are counted:
 
-Memory per GPU:
-- Shared model: 6.83B × 2 bytes = ~14 GB
-- 4 experts × 8.12B × 2 bytes = ~65 GB
-- Optimizer states: ~80 GB × 2 bytes (AdamW)
-- Total: ~80 GB — fits in A100-80GB with careful memory management
+$$
+4 \times 8.12\text{B} = 32.5\text{B params/GPU}
+$$
+
+| Component | Memory per GPU |
+|-----------|----------------|
+| BF16 expert weights | ~65 GB |
+| BF16 expert gradients | ~65 GB |
+| FP32 AdamW $m, v$ states | ~260 GB |
+| **Expert subtotal** | **~390 GB** |
+
+This excludes shared layers, activations, routing buffers, and communication
+workspace.  A feasible implementation needs sharding or offload:
+
+| Option | Approximate expert-state memory per GPU | Tradeoff |
+|--------|-----------------------------------------|----------|
+| 1 expert/GPU across 128 GPUs | ~98 GB before sharding | Still needs sharded optimiser states or offload, but avoids 4-expert packing |
+| ZeRO-1/2 sharded optimiser states | ~130–200 GB for 4 experts/GPU, depending on shard group | Reduces optimiser pressure but still tight without combining with fewer experts/GPU |
+| 8-bit optimiser states | ~195 GB for 4 experts/GPU | Helps, but does not by itself make 4 experts/GPU fit |
+| CPU optimiser offload | ~130 GB GPU for 4 experts/GPU plus large CPU RAM | Slower; may be acceptable for constrained runs |
+| 1 expert/GPU + ZeRO/8-bit/offload | <80 GB target with careful activation/gradient policy | Most plausible A100-80GB path |
+
+The training plan should assume ~128 GPUs with one expert resident per GPU
+and sharded or compressed optimiser state, not 32 GPUs with 4 full AdamW
+experts each.
 
 ---
 
@@ -184,12 +269,12 @@ Memory per GPU:
 
 ### 5.1  Progressive Quantisation
 
-Convert expert weights from FP16 to ternary progressively:
+Convert expert weights from BF16 to ternary progressively:
 
 ```
 Schedule (over 200B tokens):
-  Step 0:    100% FP16 experts
-  Step 50B:  Top 25% of weights (by magnitude) → ternary; rest FP16
+  Step 0:    100% BF16 experts
+  Step 50B:  Top 25% of weights (by magnitude) → ternary; rest BF16
   Step 100B: Top 50% → ternary
   Step 150B: Top 75% → ternary
   Step 200B: 100% ternary
@@ -225,30 +310,46 @@ roughly half the distribution).
 
 ### 5.3  Knowledge Distillation
 
-During ternary training, the FP16 seed model serves as teacher:
+During ternary training, a BF16 MoE checkpoint serves as teacher:
 
 $$
 \mathcal{L} = 0.5 \cdot \mathcal{L}_{\text{LM}} + 0.5 \cdot \text{KL}(p_{\text{ternary}} \| p_{\text{teacher}})
 $$
 
-This prevents quality degradation during quantisation.
+The student-side training compute for 200B tokens at 14.95B active parameters
+is:
+
+$$
+6 \cdot 14.95 \times 10^9 \cdot 200 \times 10^9 \approx 1.8 \times 10^{22}
+$$
+
+That is roughly **40,000 A100-hours** or **$120K** at $3/A100-hour.  Teacher
+forward passes add about 30–50%, so the practical estimate is **~55,000
+A100-hours** before restarts and evaluation.
 
 ### 5.4  Expected Quality After Ternarisation
 
-Based on BitNet b1.58 scaling laws applied to 1T MoE:
+These are **speculative targets (no empirical basis — nothing has been
+trained)**.  The -3% degradation assumption is optimistic, based on BitNet
+b1.58 results at ≤3.9B scale.  It is unvalidated at 8B-expert scale and for
+sparse MoE routing.
 
-| Benchmark | FP16 MoE (post Stage 3) | Ternary MoE (post Stage 4) | Degradation |
-|-----------|------------------------|---------------------------|-------------|
+| Benchmark | Speculative BF16 MoE target | Speculative ternary MoE target | Assumed degradation |
+|-----------|-----------------------------|--------------------------------|---------------------|
 | MMLU | ~65% | ~62% | -3% |
 | GSM8K | ~45% | ~42% | -3% |
 | HumanEval | ~40% | ~37% | -3% |
 | ARC | ~68% | ~65% | -3% |
 
-Ternary degradation is modest (~3%) because:
-1. Only expert weights are ternary; shared layers stay 2-bit GPTQ
-2. 128 experts provide redundancy — routing compensates for per-expert
-   precision loss
-3. Knowledge distillation from the FP16 teacher preserves quality
+The hypothesis is that ternary degradation is limited because:
+
+1. Only expert weights are ternary; shared layers remain higher precision or
+   separately quantised.
+2. 128 experts may provide redundancy, allowing routing to compensate for
+   per-expert precision loss.
+3. Knowledge distillation from a BF16 teacher may preserve quality.
+
+Each point is an assumption until tested.
 
 ---
 
@@ -280,13 +381,22 @@ manifold_training:
   lr: 1e-4 (only router and expert positions trainable)
   losses:
     - task_loss (cross-entropy)
-    - delta_loss (L1 between neighbours)
+    - delta_loss (L1 only between manifold-neighbour expert pairs)
     - balance_loss (Voronoi cell variance)
     - smooth_loss (routing continuity)
     - fold_loss (in-place manifold update regulariser; prevents append-style drift)
-  hardware: 8 × A100 (experts frozen, only routing trains)
-  time: ~5 days
+  hardware: 32–128 × A100 (experts frozen, router/positions train)
+  compute: ~1.5e21 FLOPs (forward-dominated)
+  a100_hours: ~3,300
+  cloud_cost_at_3_usd_per_a100_hour: ~$10K
+  time_on_128_a100s: ~1–2 days including overhead
 ```
+
+The delta-minimisation loss and the Stage 3 diversity loss are opposing
+objectives.  The only coherent version is local: delta loss applies to
+manifold-neighbour pairs that should have compact deltas; diversity applies to
+non-neighbour pairs that should remain specialised.  This reconciliation is a
+design hypothesis, not a proven property.
 
 ### 6.3  Delta File Generation
 
@@ -323,6 +433,7 @@ save_spp_config(anchor_embeddings, halfspaces)
 ### 7.2  Red-Team Calibration
 
 Run 500 adversarial prompts through the model:
+
 - Adjust $\epsilon$ (polytope inflation) to balance safety vs utility
 - Add anchors in under-covered safe regions
 - Repeat until block rate ≥ 98%
@@ -343,7 +454,7 @@ evaluation:
     - ARC-Challenge (science reasoning)
     - TruthfulQA (hallucination test)
     - WinoGrande (commonsense)
-  
+
   system_tests:
     - VRAM usage ≤ 2,684 MB
     - RAM usage ≤ 26 GB
@@ -358,42 +469,55 @@ evaluation:
 
 ## 9  Alternative: Community Training
 
-For those without $50K+ cloud budget:
+For those without a 128-GPU allocation:
 
 ### 9.1  Progressive Expert Conversion
 
 Start from an existing open model (e.g., Mixtral-8×7B, DBRX) and convert:
 
-1. Replace attention with PDR in 3/4 of layers
-2. Replace flat routing with manifold routing
-3. Progressively add experts (8 → 16 → 32 → 64 → 128)
-4. Progressively ternarise experts
-5. Fine-tune on each conversion step
+1. Replace attention with PDR in 3/4 of layers.
+2. Replace flat routing with manifold routing.
+3. Progressively add experts (8 → 16 → 32 → 64 → 128).
+4. Progressively ternarise experts.
+5. Fine-tune on each conversion step.
 
-This reduces training to ~$5K–10K but produces a non-native architecture
-(converted, not trained from scratch).
+This lowers the cash requirement but produces a non-native architecture
+(converted, not trained from scratch).  The attention→PDR conversion is itself
+unvalidated; it should be treated as a research experiment, not a reliable
+shortcut.
 
 ### 9.2  Federated Training
 
 Distribute expert training across community GPUs:
+
 - Each participant trains 1–4 experts
 - Central server coordinates routing and shared-layer updates
 - Expert weights are ternary → small upload/download per update
+
+Federated training also changes optimisation dynamics, routing balance, and
+data governance assumptions.  It needs its own validation before being used as
+evidence for the centralised training plan.
 
 ---
 
 ## 10  Compute Budget Summary
 
+Assumptions: standard $6ND$ training FLOPs, A100-80GB BF16 peak 312 TFLOP/s,
+~40% MFU (~$1.25 \times 10^{14}$ FLOP/s effective), and $3/A100-hour.
+
 | Stage | Tokens | FLOPs | A100-hours | Estimated cost |
 |-------|--------|-------|-----------|---------------|
-| 1. Dense seed | 1T | 3.2e21 | 2,700 | $8,100 |
-| 3. Expert diff | 500B | 8.1e22 | 21,500 | $64,500 |
-| 4. Ternary distill | 200B | 3.2e22 | 8,600 | $25,800 |
-| 5. Manifold align | 50B | 1.6e21 | 430 | $1,290 |
-| **Total** | **1.75T** | **~1.2e23** | **~33,200** | **~$100K** |
+| 0. Small-scale validation | ~2.5B × 3 + ternary gate | ~6e18–1e19 | <170 GPU-hours on small hardware | <$500 |
+| 1. Dense seed | 1T | ~4.1e22 | ~91,000 | ~$275K |
+| 3. Expert diff | 500B | ~4.5e22 | ~100,000 | ~$300K |
+| 4. Ternary distill | 200B | ~1.8e22 student; +30–50% teacher | ~55,000 with teacher | ~$165K |
+| 5. Manifold align | 50B | ~1.5e21 | ~3,300 | ~$10K |
+| 6–7. Safety + evaluation | — | workload-dependent | reserve margin | included in range |
+| **Total** | **~1.75T large-scale tokens** | **~1.1e23 plus eval/restarts** | **~250,000** | **~$750K nominal** |
 
-At current cloud rates (~$3/A100-hr), total training cost is approximately
-**$100K**.  This is 1000× cheaper than GPT-4 training but still substantial.
+The honest budget range is **$0.5M–1.5M**, depending on MFU achieved, spot
+pricing, restarts, data pipeline stalls, teacher-forward overhead, and
+evaluation/ablation scope.
 
 ---
 

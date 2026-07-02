@@ -6,8 +6,6 @@
 use ndarray::{Array1, Array2, Axis};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{D_MODEL, PDR_RANK};
-
 /// Recurrent state for a single PDR layer.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PdrState {
@@ -19,10 +17,10 @@ pub struct PdrState {
 }
 
 impl PdrState {
-    /// Create a new zero-initialised state.
-    pub fn new() -> Self {
+    /// Create a new zero-initialised state for the given `d_model`/`rank`.
+    pub fn new(d_model: usize, rank: usize) -> Self {
         Self {
-            state: Array2::zeros((D_MODEL, PDR_RANK)),
+            state: Array2::zeros((d_model, rank)),
             tokens_seen: 0,
         }
     }
@@ -31,9 +29,11 @@ impl PdrState {
     ///
     /// `S' = diag(gamma) S + v k^T`
     ///
-    /// If any vector has an unexpected shape, this is a no-op.
+    /// If any vector has an unexpected shape (relative to this state's own
+    /// `d_model`/`rank`, derived from `self.state`'s shape), this is a no-op.
     pub fn decay_and_accumulate(&mut self, gamma: &Array1<f32>, v: &Array1<f32>, k: &Array1<f32>) {
-        if gamma.len() != D_MODEL || v.len() != D_MODEL || k.len() != PDR_RANK {
+        let (d_model, rank) = self.state.dim();
+        if gamma.len() != d_model || v.len() != d_model || k.len() != rank {
             return;
         }
 
@@ -50,17 +50,19 @@ impl PdrState {
     ///
     /// `o_hat = S q`
     pub fn readout(&self, q: &Array1<f32>) -> Array1<f32> {
-        if q.len() != PDR_RANK {
-            return Array1::zeros(D_MODEL);
+        let (d_model, rank) = self.state.dim();
+        if q.len() != rank {
+            return Array1::zeros(d_model);
         }
         self.state.dot(q)
     }
 
     /// Mean over rank dimension for diagnostics.
     pub fn mean_state(&self) -> Array1<f32> {
+        let d_model = self.state.nrows();
         self.state
             .mean_axis(Axis(1))
-            .unwrap_or_else(|| Array1::zeros(D_MODEL))
+            .unwrap_or_else(|| Array1::zeros(d_model))
     }
 
     /// Reset state to zeros.
@@ -91,13 +93,7 @@ impl PdrState {
 
     /// Memory footprint in bytes.
     pub fn size_bytes(&self) -> usize {
-        D_MODEL * PDR_RANK * std::mem::size_of::<f32>() + std::mem::size_of::<u64>()
-    }
-}
-
-impl Default for PdrState {
-    fn default() -> Self {
-        Self::new()
+        self.state.len() * std::mem::size_of::<f32>() + std::mem::size_of::<u64>()
     }
 }
 
@@ -108,10 +104,11 @@ pub struct PdrStateBank {
 }
 
 impl PdrStateBank {
-    /// Create a new bank with `n` zero-initialised states.
-    pub fn new(n: usize) -> Self {
+    /// Create a new bank with `n` zero-initialised states of the given
+    /// `d_model`/`rank`.
+    pub fn new(n: usize, d_model: usize, rank: usize) -> Self {
         Self {
-            states: (0..n).map(|_| PdrState::new()).collect(),
+            states: (0..n).map(|_| PdrState::new(d_model, rank)).collect(),
         }
     }
 
@@ -146,21 +143,24 @@ impl PdrStateBank {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ModelDims;
 
     #[test]
     fn test_state_init() {
-        let state = PdrState::new();
-        assert_eq!(state.state.shape(), &[D_MODEL, PDR_RANK]);
+        let dims = ModelDims::tiny();
+        let state = PdrState::new(dims.d_model, dims.pdr_rank);
+        assert_eq!(state.state.shape(), &[dims.d_model, dims.pdr_rank]);
         assert_eq!(state.tokens_seen, 0);
         assert!(state.is_healthy());
     }
 
     #[test]
     fn test_decay_and_accumulate() {
-        let mut state = PdrState::new();
-        let gamma = Array1::from_vec(vec![0.9; D_MODEL]);
-        let v = Array1::from_vec(vec![1.0; D_MODEL]);
-        let k = Array1::from_vec(vec![1.0; PDR_RANK]);
+        let dims = ModelDims::tiny();
+        let mut state = PdrState::new(dims.d_model, dims.pdr_rank);
+        let gamma = Array1::from_vec(vec![0.9; dims.d_model]);
+        let v = Array1::from_vec(vec![1.0; dims.d_model]);
+        let k = Array1::from_vec(vec![1.0; dims.pdr_rank]);
 
         state.decay_and_accumulate(&gamma, &v, &k);
         assert_eq!(state.tokens_seen, 1);
@@ -175,18 +175,20 @@ mod tests {
 
     #[test]
     fn test_readout_shape() {
-        let state = PdrState::new();
-        let q = Array1::ones(PDR_RANK);
+        let dims = ModelDims::tiny();
+        let state = PdrState::new(dims.d_model, dims.pdr_rank);
+        let q = Array1::ones(dims.pdr_rank);
         let out = state.readout(&q);
-        assert_eq!(out.len(), D_MODEL);
+        assert_eq!(out.len(), dims.d_model);
     }
 
     #[test]
     fn test_serialisation_roundtrip() {
-        let mut state = PdrState::new();
-        let gamma = Array1::from_vec(vec![0.5; D_MODEL]);
-        let v = Array1::from_vec(vec![0.3; D_MODEL]);
-        let k = Array1::from_vec(vec![0.4; PDR_RANK]);
+        let dims = ModelDims::tiny();
+        let mut state = PdrState::new(dims.d_model, dims.pdr_rank);
+        let gamma = Array1::from_vec(vec![0.5; dims.d_model]);
+        let v = Array1::from_vec(vec![0.3; dims.d_model]);
+        let k = Array1::from_vec(vec![0.4; dims.pdr_rank]);
         state.decay_and_accumulate(&gamma, &v, &k);
 
         let bytes = state.to_bytes().unwrap();
@@ -197,21 +199,23 @@ mod tests {
 
     #[test]
     fn test_state_bank() {
-        let bank = PdrStateBank::new(60);
-        assert_eq!(bank.states.len(), 60);
+        let dims = ModelDims::tiny();
+        let bank = PdrStateBank::new(dims.n_pdr_layers, dims.d_model, dims.pdr_rank);
+        assert_eq!(bank.states.len(), dims.n_pdr_layers);
         assert!(bank.all_healthy());
     }
 
     #[test]
     fn test_norm() {
-        let mut state = PdrState::new();
+        let dims = ModelDims::tiny();
+        let mut state = PdrState::new(dims.d_model, dims.pdr_rank);
         assert!((state.norm() - 0.0).abs() < 1e-8);
 
-        let gamma = Array1::ones(D_MODEL);
-        let v = Array1::ones(D_MODEL);
-        let k = Array1::ones(PDR_RANK);
+        let gamma = Array1::ones(dims.d_model);
+        let v = Array1::ones(dims.d_model);
+        let k = Array1::ones(dims.pdr_rank);
         state.decay_and_accumulate(&gamma, &v, &k);
-        let expected_norm = ((D_MODEL * PDR_RANK) as f32).sqrt();
+        let expected_norm = ((dims.d_model * dims.pdr_rank) as f32).sqrt();
         assert!((state.norm() - expected_norm).abs() < 1e-4);
     }
 }

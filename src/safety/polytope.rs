@@ -7,8 +7,14 @@
 //! For any output representation x, we compute:
 //!   x_safe = project_P(x)
 //!
-//! This projection is non-differentiable — no gradient can escape through it,
-//! making jailbreak attempts via gradient-based adversarial attacks impossible.
+//! This projection guarantees a hard geometric constraint — OUTPUT
+//! MEMBERSHIP in the polytope P — for the returned point. It does NOT
+//! guarantee semantic safety, and it is NOT immune to gradient-based or
+//! gradient-free adversarial attacks: halfspace projection is
+//! piecewise-linear and differentiable almost everywhere, so attacks against
+//! the upstream model (including BPDA-style attacks through the projection)
+//! remain possible. At best, the projection raises attack difficulty by
+//! constraining the reachable output region.
 
 use ndarray::Array1;
 

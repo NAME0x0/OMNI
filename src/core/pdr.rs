@@ -17,8 +17,6 @@
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{D_MODEL, PDR_RANK};
-
 use super::pdr_state::PdrState;
 
 /// Weights for a single PDR layer.
@@ -50,25 +48,31 @@ pub struct PdrLayer {
 }
 
 impl PdrLayer {
-    /// Create a new PDR layer with zero-initialised weights.
-    pub fn zeros(layer_idx: usize) -> Self {
+    /// Create a new PDR layer with zero-initialised weights, sized for the
+    /// given `d_model`/`rank`.
+    pub fn zeros(layer_idx: usize, d_model: usize, rank: usize) -> Self {
         Self {
-            w_p: Array2::zeros((D_MODEL, D_MODEL)),
-            b_p: Array1::zeros(D_MODEL),
-            w_k: Array2::zeros((PDR_RANK, D_MODEL)),
-            w_v: Array2::zeros((D_MODEL, D_MODEL)),
-            w_q: Array2::zeros((PDR_RANK, D_MODEL)),
-            w_o: Array2::zeros((D_MODEL, D_MODEL)),
-            rms_scale: Array1::ones(D_MODEL),
+            w_p: Array2::zeros((d_model, d_model)),
+            b_p: Array1::zeros(d_model),
+            w_k: Array2::zeros((rank, d_model)),
+            w_v: Array2::zeros((d_model, d_model)),
+            w_q: Array2::zeros((rank, d_model)),
+            w_o: Array2::zeros((d_model, d_model)),
+            rms_scale: Array1::ones(d_model),
             layer_idx,
         }
+    }
+
+    /// This layer's `d_model`, derived from the stored weight shapes.
+    fn d_model(&self) -> usize {
+        self.rms_scale.len()
     }
 
     /// Single-step forward pass (autoregressive decode).
     ///
     /// Updates `state` in-place and returns the output hidden state.
     pub fn forward_step(&self, h: &Array1<f32>, state: &mut PdrState) -> Array1<f32> {
-        if h.len() != D_MODEL {
+        if h.len() != self.d_model() {
             return h.clone();
         }
 
@@ -104,7 +108,7 @@ impl PdrLayer {
         state: &mut PdrState,
     ) -> Array2<f32> {
         let seq_len = h_seq.nrows();
-        let mut outputs = Array2::zeros((seq_len, D_MODEL));
+        let mut outputs = Array2::zeros((seq_len, self.d_model()));
 
         // Sequential reference path (parallel scan can replace this later).
         for t in 0..seq_len {
@@ -118,14 +122,13 @@ impl PdrLayer {
 
     /// Parameter count for this layer.
     pub fn param_count(&self) -> usize {
-        let w_p = D_MODEL * D_MODEL;
-        let b_p = D_MODEL;
-        let w_k = PDR_RANK * D_MODEL;
-        let w_v = D_MODEL * D_MODEL;
-        let w_q = PDR_RANK * D_MODEL;
-        let w_o = D_MODEL * D_MODEL;
-        let rms = D_MODEL;
-        w_p + b_p + w_k + w_v + w_q + w_o + rms
+        self.w_p.len()
+            + self.b_p.len()
+            + self.w_k.len()
+            + self.w_v.len()
+            + self.w_q.len()
+            + self.w_o.len()
+            + self.rms_scale.len()
     }
 }
 
@@ -145,25 +148,28 @@ fn sigmoid(x: &Array1<f32>) -> Array1<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ModelDims;
     use ndarray::Array1;
 
     #[test]
     fn test_pdr_step_shape() {
-        let layer = PdrLayer::zeros(0);
-        let mut state = PdrState::new();
-        let h = Array1::ones(D_MODEL);
+        let dims = ModelDims::tiny();
+        let layer = PdrLayer::zeros(0, dims.d_model, dims.pdr_rank);
+        let mut state = PdrState::new(dims.d_model, dims.pdr_rank);
+        let h = Array1::ones(dims.d_model);
         let out = layer.forward_step(&h, &mut state);
-        assert_eq!(out.len(), D_MODEL);
+        assert_eq!(out.len(), dims.d_model);
     }
 
     #[test]
     fn test_pdr_residual() {
         // With zero weights, output should equal input (residual only)
-        let layer = PdrLayer::zeros(0);
-        let mut state = PdrState::new();
-        let h = Array1::from_vec(vec![1.0; D_MODEL]);
+        let dims = ModelDims::tiny();
+        let layer = PdrLayer::zeros(0, dims.d_model, dims.pdr_rank);
+        let mut state = PdrState::new(dims.d_model, dims.pdr_rank);
+        let h = Array1::from_vec(vec![1.0; dims.d_model]);
         let out = layer.forward_step(&h, &mut state);
-        for i in 0..D_MODEL {
+        for i in 0..dims.d_model {
             assert!((out[i] - h[i]).abs() < 1e-5, "Residual broken at {}", i);
         }
     }
@@ -191,8 +197,11 @@ mod tests {
 
     #[test]
     fn test_pdr_param_count() {
-        let layer = PdrLayer::zeros(0);
-        let expected = 3 * D_MODEL * D_MODEL + 2 * PDR_RANK * D_MODEL + 2 * D_MODEL;
+        let dims = ModelDims::tiny();
+        let layer = PdrLayer::zeros(0, dims.d_model, dims.pdr_rank);
+        let expected = 3 * dims.d_model * dims.d_model
+            + 2 * dims.pdr_rank * dims.d_model
+            + 2 * dims.d_model;
         assert_eq!(layer.param_count(), expected);
     }
 }

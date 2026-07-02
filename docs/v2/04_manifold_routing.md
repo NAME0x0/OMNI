@@ -33,8 +33,9 @@ Benefits:
 - **Spatial locality →** nearby experts share most weights → delta streaming
 - **Smooth routing →** the manifold coordinate is continuous even when the
   discrete selection jumps
-- **Natural load balancing →** uniform expert placement on the torus gives
-  each expert an equal Voronoi cell
+- **Load-balancing prior →** uniform expert placement on the torus gives
+  each expert an equal Voronoi cell, but an auxiliary balance loss is still
+  required because routing queries need not be uniformly distributed
 - **Foldable updates →** new routing evidence is folded into existing expert
   coordinates rather than appended as new manifold entries
 
@@ -74,7 +75,9 @@ where $\epsilon_1, \epsilon_2, \epsilon_3 \sim \mathcal{N}(0, 0.01)$ are learned
 
 Each expert owns a Voronoi cell on the torus — the set of all points closer
 to it than to any other expert.  For a near-uniform grid, each cell has
-volume $\approx \frac{1}{128}$, giving natural load balance.
+volume $\approx \frac{1}{128}$, giving a useful load-balancing prior if
+routing queries are close to uniform.  Since training can concentrate queries
+in some regions, geometry alone does not guarantee balanced utilisation.
 
 During training, a **manifold-consistency loss** nudges expert positions so
 that Voronoi cells remain roughly equal:
@@ -84,6 +87,11 @@ $$
 $$
 
 where $A_i$ is the empirical routing frequency of expert $i$ over a batch.
+
+At random initialisation, `examples/routing_balance.rs` measured routing
+balance over 10K random tokens at Gini 0.062-0.069 with all 128 experts
+reached.  This characterises the untrained router only; trained behaviour is
+unknown.
 
 ---
 
@@ -123,8 +131,26 @@ $$
 \text{Possible paths} = 128^{60} \approx 10^{126}
 $$
 
-This is the key to the model's effective capacity: 1.05T parameters span
-an astronomically larger function space through combinatorial composition.
+This combinatorial-path property is not unique to manifold routing; any
+per-layer-routed MoE, including Switch-style or Mixtral-style designs with
+independent routing at each layer, has the same kind of path count.  The
+hypothesis is that this shared per-layer composition effect contributes to
+effective capacity, while manifold routing adds locality and delta-streaming
+structure on top.
+
+### 3.4  Routing Bottleneck Risk (open question)
+
+The router projects $h_t \in \mathbb{R}^{4096}$ to
+$z_{\text{query}} \in \mathbb{R}^3$ before expert selection.  This
+3-dimensional routing space is a severe information bottleneck compared with
+a standard 128-way linear router with $128 \times 4096$ parameters.  Whether
+three dimensions suffice to learn high-quality expert assignments is an open
+empirical question.
+
+The compensating factor is that each of the 60 expert layers has its own
+$W_{\text{route}}^{(\ell)}$, so the bottleneck is per-layer rather than
+global.  Stage 0 / small-scale MoE validation in the training plan (see
+Section 10) must test routing quality, not just routing balance.
 
 ---
 
@@ -151,7 +177,14 @@ $$
 \mathcal{L}_{\text{delta}} = \lambda \sum_{(i,j) \in \text{neighbours}} \left\| W_j - W_i \right\|_1
 $$
 
-We encourage adjacent experts to be similar.  Empirical expectation:
+We encourage adjacent experts to be similar.
+
+This delta-minimisation objective is in tension with the Stage 3 diversity
+loss in the training plan; the intended reconciliation is delta loss on
+manifold-neighbour pairs only and diversity loss on non-neighbour pairs,
+which remains a design hypothesis.
+
+Design assumptions (unvalidated - no trained experts exist):
 
 | Metric | Full layer | Delta (neighbour) | Delta (2-hop) |
 |--------|-----------|-------------------|---------------|
@@ -169,7 +202,7 @@ token.  For the current token:
 3. **2-hop expert:** Stream full layer but from a compressed delta (1.16 ms).
 4. **Distant expert:** Full layer load (3.86 ms).
 
-Expected distribution (from language modelling statistics):
+Assumed distribution (unvalidated; depends on trained routing behaviour):
 
 | Case | Frequency | Transfer time |
 |------|-----------|--------------|
@@ -179,7 +212,8 @@ Expected distribution (from language modelling statistics):
 | Distant | ~15% | 3.86 ms |
 | **Weighted average** | | **~0.89 ms** |
 
-This is ~4× faster than always loading full layers.
+This is projected ~4× under these assumptions compared with always loading
+full layers.
 
 ### 4.4  Delta Storage Format
 
@@ -258,7 +292,7 @@ which expert region the model thinks is most relevant.
 | Topology | Flat index | Flat index | 3-D torus |
 | Locality | None | None | **Geodesic distance** |
 | Delta streaming | N/A | N/A | **3-10× less transfer** |
-| Load balance | Aux loss | Token dropping | **Geometric (Voronoi)** |
+| Load balance | Aux loss | Token dropping | **Geometric prior + aux loss** |
 | Interpolation | None | Soft routing | **Smooth manifold** |
 | Interpretability | ❌ | ❌ | **✅ Slice-based manifold visualisation** |
 | Router params | N × d | N × d | **3 × d** (project to R³) |
