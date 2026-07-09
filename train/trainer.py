@@ -208,10 +208,33 @@ class HubCheckpointSync:
         self.path_in_repo = path_in_repo.strip("/")
         self.log_fn = log_fn
         self._threads: list[threading.Thread] = []
+        self._repo_exists_checked = False
+        self._repo_lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
         return bool(self.repo_id)
+
+    def _ensure_repo_exists(self, token: str | None) -> None:
+        if not self.enabled or self._repo_exists_checked or not token:
+            return
+        with self._repo_lock:
+            if self._repo_exists_checked:
+                return
+            try:
+                if self.client is not None:
+                    create_repo_fn = getattr(self.client, "create_repo", None)
+                    if create_repo_fn is None:
+                        self._repo_exists_checked = True
+                        return
+                else:
+                    from huggingface_hub import create_repo
+
+                    create_repo_fn = create_repo
+                create_repo_fn(self.repo_id, exist_ok=True, private=True, token=token)
+                self._repo_exists_checked = True
+            except Exception as exc:  # pragma: no cover - network failure path
+                self.log_fn(f"Warning: failed to ensure Hub checkpoint repo exists: {exc}")
 
     def upload_async(self, folder_path: str | Path) -> None:
         if not self.enabled:
@@ -228,11 +251,12 @@ class HubCheckpointSync:
     def download_latest(self, checkpoint_root: str | Path) -> Path | None:
         if not self.enabled:
             return None
+        token = self.token or os.getenv("HF_TOKEN")
+        self._ensure_repo_exists(token)
         if self.client is not None and hasattr(self.client, "download_latest"):
             result = self.client.download_latest(self.repo_id, Path(checkpoint_root), self.path_in_repo)
             return Path(result) if result else None
 
-        token = self.token or os.getenv("HF_TOKEN")
         if not token:
             self.log_fn("HF_TOKEN is not set; skipping checkpoint download")
             return None
@@ -270,6 +294,7 @@ class HubCheckpointSync:
             self.log_fn("HF_TOKEN is not set; skipping checkpoint upload")
             return
         try:
+            self._ensure_repo_exists(token)
             client = self.client
             if client is None:
                 from huggingface_hub import HfApi

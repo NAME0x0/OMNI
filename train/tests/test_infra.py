@@ -123,6 +123,33 @@ def test_hub_sync_uses_injected_client_without_network(work_dir):
     assert fake.calls[0]["folder_path"] == str(folder)
 
 
+def test_hub_sync_creates_repo_before_first_upload_when_client_supports_it(work_dir):
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def create_repo(self, repo_id, *, exist_ok, private, token):
+            self.calls.append(("create_repo", repo_id, exist_ok, private, token))
+
+        def upload_folder(self, **kwargs):
+            self.calls.append(("upload_folder", kwargs))
+
+    folder = work_dir / "checkpoints"
+    folder.mkdir()
+    (folder / "latest.json").write_text("{}", encoding="utf-8")
+    fake = FakeClient()
+
+    sync = HubCheckpointSync("user/repo", client=fake, token="token")
+    sync.upload_async(folder)
+    sync.wait()
+    sync.upload_async(folder)
+    sync.wait()
+
+    assert fake.calls[0] == ("create_repo", "user/repo", True, True, "token")
+    assert [call[0] for call in fake.calls].count("create_repo") == 1
+    assert [call[0] for call in fake.calls].count("upload_folder") == 2
+
+
 def test_hub_sync_upload_failures_do_not_raise(work_dir):
     class FailingClient:
         def upload_folder(self, **_kwargs):

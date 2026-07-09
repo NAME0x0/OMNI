@@ -1,4 +1,6 @@
-torch>=2.10
+# torch floor deliberately low: Kaggle images ship a CUDA-matched torch
+# that must NOT be upgraded by this file (notebook install cell skips it).
+torch>=2.4
 pytest>=8.0
 numpy>=2.0
 datasets>=2.20
