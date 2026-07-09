@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum", type=int, default=None)
     parser.add_argument("--chunk-len", type=int, default=DEFAULT_CHUNK_LEN)
     parser.add_argument("--save-minutes", type=float, default=15.0)
+    parser.add_argument("--hub-keep-last", type=int, default=2)
     parser.add_argument("--eval-steps", type=int, default=1_000)
     parser.add_argument("--eval-tokens", type=int, default=200_000)
     parser.add_argument("--eval-docs", type=int, default=2_000)
@@ -124,7 +125,7 @@ def main() -> None:
         train_iterator=train_iter,
         eval_iterator_factory=eval_factory,
         config=trainer_config,
-        hub_sync=HubCheckpointSync(args.hub_repo),
+        hub_sync=HubCheckpointSync(args.hub_repo, keep_last=args.hub_keep_last),
     )
     loaded = trainer.load_checkpoint()
     if loaded is None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import shutil
 from pathlib import Path
@@ -161,6 +162,98 @@ def test_hub_sync_upload_failures_do_not_raise(work_dir):
 
     sync.upload_async(folder)
     sync.wait()
+
+
+def test_hub_sync_prunes_old_hub_checkpoints_after_upload(work_dir):
+    class FakeClient:
+        def __init__(self) -> None:
+            self.uploads = []
+            self.deleted = []
+
+        def upload_folder(self, **kwargs):
+            self.uploads.append(kwargs)
+
+        def list_repo_files(self, **_kwargs):
+            return [
+                "checkpoints/latest.json",
+                "checkpoints/metrics.jsonl",
+                "checkpoints/checkpoint-step-0000000001/state.pt",
+                "checkpoints/checkpoint-step-0000000001/metadata.json",
+                "checkpoints/checkpoint-step-0000000002/state.pt",
+                "checkpoints/checkpoint-step-0000000003/state.pt",
+            ]
+
+        def delete_folder(self, **kwargs):
+            self.deleted.append(kwargs)
+
+    folder = work_dir / "checkpoints"
+    folder.mkdir()
+    fake = FakeClient()
+
+    sync = HubCheckpointSync("user/repo", client=fake, token="token", keep_last=2)
+    sync.upload_async(folder)
+    sync.wait()
+
+    assert len(fake.uploads) == 1
+    assert [call["path_in_repo"] for call in fake.deleted] == ["checkpoints/checkpoint-step-0000000001"]
+
+
+def test_hub_sync_pruning_skips_client_without_delete_ops(work_dir):
+    class UploadOnlyClient:
+        def __init__(self) -> None:
+            self.uploads = 0
+
+        def upload_folder(self, **_kwargs):
+            self.uploads += 1
+
+    folder = work_dir / "checkpoints"
+    folder.mkdir()
+    fake = UploadOnlyClient()
+
+    sync = HubCheckpointSync("user/repo", client=fake, token="token", keep_last=2)
+    sync.upload_async(folder)
+    sync.wait()
+
+    assert fake.uploads == 1
+
+
+def test_hub_resume_downloads_metrics_and_new_lines_append(work_dir):
+    source = _tiny_trainer(work_dir / "source")
+    for _ in range(2):
+        source.train_one_step()
+    checkpoint = source.save_checkpoint(reason="test", wait_for_upload=True)
+    old_metric = {"step": 2, "loss": 9.0, "tokens_total": 32}
+    source.metrics_path.write_text(json.dumps(old_metric) + "\n", encoding="utf-8")
+
+    class FakeDownloadClient:
+        def download_latest(self, _repo_id, checkpoint_root, _path_in_repo):
+            checkpoint_root = Path(checkpoint_root)
+            checkpoint_root.mkdir(parents=True, exist_ok=True)
+            target_dir = checkpoint_root / checkpoint.parent.name
+            shutil.copytree(checkpoint.parent, target_dir)
+            latest = {"latest": target_dir.name, "step": 2, "reason": "test"}
+            (checkpoint_root / "latest.json").write_text(json.dumps(latest), encoding="utf-8")
+            return target_dir / "state.pt"
+
+        def download_file(self, *, filename, local_path, **_kwargs):
+            assert filename == "checkpoints/metrics.jsonl"
+            shutil.copy2(source.metrics_path, local_path)
+            return local_path
+
+    resumed = _tiny_trainer(work_dir / "resumed")
+    resumed.hub_sync = HubCheckpointSync("user/repo", client=FakeDownloadClient(), token="token")
+
+    loaded = resumed.load_checkpoint()
+    assert loaded is not None
+    assert resumed.metrics_path.read_text(encoding="utf-8").splitlines() == [json.dumps(old_metric)]
+
+    metrics = resumed.train_one_step()
+    resumed._tokens_since_log += int(metrics["tokens"])
+    resumed.log_metrics(metrics)
+
+    lines = resumed.metrics_path.read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[0]) == old_metric
+    assert json.loads(lines[1])["step"] == 3
 
 
 @pytest.mark.parametrize("variant", ["pdr", "gla", "transformer"])

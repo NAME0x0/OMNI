@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import signal
 import threading
@@ -191,7 +192,14 @@ def _is_no_decay_parameter(module: nn.Module, param_name: str, full_name: str, p
 
 
 class HubCheckpointSync:
-    """Best-effort HuggingFace Hub checkpoint sync with injectable clients."""
+    """Best-effort HuggingFace Hub checkpoint sync with injectable clients.
+
+    Hub pruning matters because each Stage 0 checkpoint is roughly 1.5 GB
+    (fp32 weights plus AdamW state at 123.5M parameters); without pruning,
+    weeks of 15-minute saves would bloat a free Hub repo into the hundreds of
+    GB.  Pruning is intentionally best effort and never allowed to stop
+    training.
+    """
 
     def __init__(
         self,
@@ -200,12 +208,14 @@ class HubCheckpointSync:
         client: Any | None = None,
         token: str | None = None,
         path_in_repo: str = "checkpoints",
+        keep_last: int = 2,
         log_fn: Callable[[str], None] = print,
     ) -> None:
         self.repo_id = repo_id
         self.client = client
         self.token = token
         self.path_in_repo = path_in_repo.strip("/")
+        self.keep_last = keep_last
         self.log_fn = log_fn
         self._threads: list[threading.Thread] = []
         self._repo_exists_checked = False
@@ -255,6 +265,8 @@ class HubCheckpointSync:
         self._ensure_repo_exists(token)
         if self.client is not None and hasattr(self.client, "download_latest"):
             result = self.client.download_latest(self.repo_id, Path(checkpoint_root), self.path_in_repo)
+            if result:
+                self._download_metrics_file(Path(checkpoint_root), token)
             return Path(result) if result else None
 
         if not token:
@@ -283,10 +295,56 @@ class HubCheckpointSync:
                     token=token,
                 )
                 shutil.copy2(src, checkpoint_dir / filename)
+            self._download_metrics_file(Path(checkpoint_root), token)
             return checkpoint_dir / "state.pt"
         except Exception as exc:  # pragma: no cover - network failure path
             self.log_fn(f"Hub checkpoint download failed: {exc}")
             return None
+
+    def prune_old_hub_checkpoints(self, keep_last: int | None = None) -> None:
+        """Delete remote checkpoint folders older than the newest ``keep_last``.
+
+        Each Stage 0 checkpoint is about 1.5 GB (fp32 weights plus AdamW state
+        for a 123.5M parameter model).  If 15-minute checkpoint folders are
+        never pruned, a multi-week free-tier run can grow into hundreds of GB
+        on the Hub.  This method only removes ``checkpoint-step-*`` folders and
+        leaves root files such as ``latest.json`` and ``metrics.jsonl`` intact.
+        Missing client capabilities are treated as "pruning unavailable" and
+        skipped silently; real Hub failures are logged as warnings.
+        """
+
+        if not self.enabled:
+            return
+        keep = self.keep_last if keep_last is None else int(keep_last)
+        if keep < 0:
+            return
+
+        token = self.token or os.getenv("HF_TOKEN")
+        try:
+            client = self.client
+            if client is None:
+                try:
+                    from huggingface_hub import HfApi
+                except ImportError:
+                    return
+
+                client = HfApi()
+
+            files = self._list_repo_files(client, token)
+            if files is None:
+                return
+            folders = self._checkpoint_folders_from_repo_files(files)
+            doomed = folders[:-keep] if keep else folders
+            if not doomed:
+                return
+            if not self._delete_hub_folders(client, doomed, token):
+                return
+            self.log_fn(
+                "Hub checkpoint pruning deleted "
+                f"{len(doomed)} old folder(s): {', '.join(path.rsplit('/', 1)[-1] for path in doomed)}"
+            )
+        except Exception as exc:  # pragma: no cover - network failure path
+            self.log_fn(f"Warning: failed to prune old Hub checkpoints: {exc}")
 
     def _upload_folder(self, folder_path: Path) -> None:
         token = self.token or os.getenv("HF_TOKEN")
@@ -306,8 +364,122 @@ class HubCheckpointSync:
                 path_in_repo=self.path_in_repo,
                 token=token,
             )
+            self.prune_old_hub_checkpoints(self.keep_last)
         except Exception as exc:
             self.log_fn(f"Hub checkpoint upload failed: {exc}")
+
+    def _download_metrics_file(self, checkpoint_root: Path, token: str | None) -> None:
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+        remote_name = f"{self.path_in_repo}/metrics.jsonl" if self.path_in_repo else "metrics.jsonl"
+        target = checkpoint_root / "metrics.jsonl"
+
+        if self.client is not None:
+            download_file_fn = getattr(self.client, "download_file", None)
+            if download_file_fn is None:
+                return
+            try:
+                result = self._call_download_file(download_file_fn, remote_name, target, token)
+                if result is not None:
+                    self._copy_download_result(result, target)
+            except FileNotFoundError:
+                return
+            except Exception as exc:
+                self.log_fn(f"Warning: failed to download Hub metrics.jsonl: {exc}")
+            return
+
+        try:
+            from huggingface_hub import hf_hub_download
+
+            src = hf_hub_download(repo_id=self.repo_id, filename=remote_name, token=token)
+            shutil.copy2(src, target)
+        except Exception as exc:  # pragma: no cover - network/missing-file path
+            self.log_fn(f"Warning: failed to download Hub metrics.jsonl: {exc}")
+
+    def _call_download_file(
+        self,
+        download_file_fn: Callable[..., Any],
+        remote_name: str,
+        target: Path,
+        token: str | None,
+    ) -> Any:
+        try:
+            return download_file_fn(
+                repo_id=self.repo_id,
+                filename=remote_name,
+                local_path=target,
+                token=token,
+            )
+        except TypeError:
+            try:
+                return download_file_fn(self.repo_id, remote_name, target, token=token)
+            except TypeError:
+                return download_file_fn(self.repo_id, remote_name, target)
+
+    def _copy_download_result(self, result: Any, target: Path) -> None:
+        src = Path(result)
+        if src.exists() and src.resolve() != target.resolve():
+            shutil.copy2(src, target)
+
+    def _list_repo_files(self, client: Any, token: str | None) -> list[str] | None:
+        list_fn = getattr(client, "list_repo_files", None)
+        if list_fn is None:
+            return None
+        try:
+            return list(list_fn(repo_id=self.repo_id, token=token))
+        except TypeError:
+            try:
+                return list(list_fn(self.repo_id, token=token))
+            except TypeError:
+                return list(list_fn(self.repo_id))
+
+    def _checkpoint_folders_from_repo_files(self, files: list[str]) -> list[str]:
+        base = f"{self.path_in_repo}/" if self.path_in_repo else ""
+        pattern = re.compile(rf"^{re.escape(base)}(checkpoint-step-(\d+))(?:/|$)")
+        by_step: dict[int, str] = {}
+        for filename in files:
+            normalized = str(filename).replace("\\", "/")
+            match = pattern.match(normalized)
+            if match:
+                by_step[int(match.group(2))] = f"{base}{match.group(1)}"
+        return [folder for _step, folder in sorted(by_step.items())]
+
+    def _delete_hub_folders(self, client: Any, folders: list[str], token: str | None) -> bool:
+        delete_folder_fn = getattr(client, "delete_folder", None)
+        if delete_folder_fn is not None:
+            for folder in folders:
+                self._call_delete_folder(delete_folder_fn, folder, token)
+            return True
+
+        create_commit_fn = getattr(client, "create_commit", None)
+        if create_commit_fn is None:
+            return False
+        try:
+            from huggingface_hub import CommitOperationDelete
+        except ImportError:
+            return False
+
+        operations = [CommitOperationDelete(path_in_repo=folder, is_folder=True) for folder in folders]
+        message = f"Prune old Stage 0 checkpoints, keep last {self.keep_last}"
+        try:
+            create_commit_fn(repo_id=self.repo_id, operations=operations, commit_message=message, token=token)
+        except TypeError:
+            create_commit_fn(self.repo_id, operations, message)
+        return True
+
+    def _call_delete_folder(self, delete_folder_fn: Callable[..., Any], folder: str, token: str | None) -> None:
+        message = f"Prune old Stage 0 checkpoint {folder.rsplit('/', 1)[-1]}"
+        try:
+            delete_folder_fn(
+                repo_id=self.repo_id,
+                path_in_repo=folder,
+                token=token,
+                commit_message=message,
+            )
+        except TypeError:
+            try:
+                delete_folder_fn(self.repo_id, folder, token=token, commit_message=message)
+            except TypeError:
+                delete_folder_fn(self.repo_id, folder)
 
 
 class Stage0Trainer:
@@ -486,10 +658,14 @@ class Stage0Trainer:
             "lr": metrics["lr"],
             "grad_norm": metrics["grad_norm"],
             "tokens": int(metrics["tokens"]),
+            **self._progress_fields(tokens_per_sec=tokens_per_sec),
         }
         self._write_metric(record)
+        eta_hours = record["eta_hours"]
+        eta_text = "unknown" if eta_hours is None else f"{eta_hours:.2f}h"
         print(
             f"step={self.global_step} loss={metrics['loss']:.4f} "
+            f"tokens_done={record['tokens_total']:,} pct={record['pct_complete']:.2f}% eta={eta_text} "
             f"tokens/sec={tokens_per_sec:.1f} lr={metrics['lr']:.6g} "
             f"grad_norm={metrics['grad_norm']:.3f}",
             flush=True,
@@ -515,6 +691,7 @@ class Stage0Trainer:
             "data_state": self._data_state(),
             "data_skip_documents": self._data_skip_documents(),
             "trainer_config": asdict(self.config),
+            "model_config": self._model_config_state(),
             "grad_accumulation_steps": self.grad_accumulation_steps,
             "reason": reason,
         }
@@ -586,6 +763,20 @@ class Stage0Trainer:
         with self.metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
+    def _progress_fields(self, *, tokens_per_sec: float | None = None) -> dict[str, float | int | None]:
+        tokens_per_step = self.config.seq_len * self.config.micro_batch_size * self.grad_accumulation_steps
+        tokens_total = int(self.global_step * tokens_per_step)
+        target_tokens = max(1, int(self.config.max_steps * tokens_per_step))
+        pct_complete = min(100.0, 100.0 * tokens_total / target_tokens)
+        eta_hours = None
+        if tokens_per_sec is not None and tokens_per_sec > 0 and tokens_total < target_tokens:
+            eta_hours = (target_tokens - tokens_total) / tokens_per_sec / 3600.0
+        return {
+            "tokens_total": tokens_total,
+            "pct_complete": pct_complete,
+            "eta_hours": eta_hours,
+        }
+
     def _save_due(self) -> bool:
         return (time.time() - self._last_save_time) >= self.config.save_minutes * 60.0
 
@@ -607,6 +798,15 @@ class Stage0Trainer:
             return int(value) if value is not None else None
         value = state.get("data_skip_documents", state.get("documents_seen")) if isinstance(state, dict) else None
         return int(value) if value is not None else None
+
+    def _model_config_state(self) -> dict[str, Any] | None:
+        config = getattr(self.model, "config", None)
+        if config is None:
+            return None
+        try:
+            return asdict(config)
+        except TypeError:
+            return dict(getattr(config, "__dict__", {}))
 
     def _rotate_checkpoints(self, *, keep: int) -> None:
         checkpoints = sorted(
@@ -654,7 +854,12 @@ def _restore_rng_state(state: dict[str, Any], device: torch.device) -> None:
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch"].cpu())
     if device.type == "cuda" and state.get("cuda") is not None:
-        torch.cuda.set_rng_state_all(state["cuda"])
+        cuda_states = []
+        for item in state["cuda"]:
+            if isinstance(item, torch.Tensor):
+                cuda_states.append(item.detach().cpu().to(dtype=torch.uint8))
+        if cuda_states:
+            torch.cuda.set_rng_state_all(cuda_states)
 
 
 __all__ = [
