@@ -1,0 +1,6 @@
+torch>=2.10
+pytest>=8.0
+numpy>=2.0
+datasets>=2.20
+transformers>=4.42
+huggingface_hub>=0.24

@@ -56,7 +56,11 @@ Train three ~125M-parameter models with matched dimensions and token budgets:
 Use ~2.5B tokens, for example a SlimPajama subset.  This is roughly
 $6 \cdot 125\text{M} \cdot 2.5\text{B} \approx 1.9 \times 10^{18}$ FLOPs per
 model, so the full comparison fits on a single node with 1–8 consumer or A100
-GPUs.  Target budget: **<$500**.
+GPUs.  Target budget: **<$500 rented, or $0 cash on free tiers** — Kaggle
+(30 GPU-h/week) plus free Colab supply roughly $3 \times 10^{18}$ FLOPs/week
+at T4/P100-class throughput, so the full three-model comparison completes in
+~2–3 calendar weeks with interruption-tolerant checkpointing (checkpoints
+synced to a free Hugging Face Hub repo).
 
 #### Gate Criteria
 
@@ -507,7 +511,7 @@ Assumptions: standard $6ND$ training FLOPs, A100-80GB BF16 peak 312 TFLOP/s,
 
 | Stage | Tokens | FLOPs | A100-hours | Estimated cost |
 |-------|--------|-------|-----------|---------------|
-| 0. Small-scale validation | ~2.5B × 3 + ternary gate | ~6e18–1e19 | <170 GPU-hours on small hardware | <$500 |
+| 0. Small-scale validation | ~2.5B × 3 + ternary gate | ~6e18–1e19 | <170 GPU-hours on small hardware | <$500 rented; $0 on free Kaggle/Colab over ~3–4 weeks |
 | 1. Dense seed | 1T | ~4.1e22 | ~91,000 | ~$275K |
 | 3. Expert diff | 500B | ~4.5e22 | ~100,000 | ~$300K |
 | 4. Ternary distill | 200B | ~1.8e22 student; +30–50% teacher | ~55,000 with teacher | ~$165K |

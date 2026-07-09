@@ -29,3 +29,11 @@ checkpoints/
 
 # Logs
 *.log
+
+# Python (Stage 0 training)
+__pycache__/
+*.pyc
+.pytest_cache/
+train/.pytest_tmp/
+train/runs/
+metrics.jsonl
